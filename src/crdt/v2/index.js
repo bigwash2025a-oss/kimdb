@@ -1285,6 +1285,376 @@ export class CRDTDocument {
   }
 }
 
+// ===== Undo/Redo Manager =====
+export class UndoManager {
+  constructor(options = {}) {
+    this.maxHistory = options.maxHistory || 100;
+    this.undoStack = [];  // { ops, inverseOps, timestamp }
+    this.redoStack = [];
+    this.captureTimeout = options.captureTimeout || 500; // ms
+    this.pendingOps = [];
+    this.pendingTimer = null;
+    this.trackedPaths = options.trackedPaths || null; // null = 전체, ['content'] = content만
+  }
+
+  // Op 역연산 생성
+  invertOp(op) {
+    switch (op.type) {
+      case 'map_set':
+        // set의 역은 이전 값으로 set (또는 delete)
+        if (op.previousValue !== undefined) {
+          return {
+            ...op,
+            type: 'map_set',
+            value: op.previousValue,
+            previousValue: op.value
+          };
+        } else {
+          return {
+            ...op,
+            type: 'map_delete',
+            previousValue: op.value
+          };
+        }
+
+      case 'map_delete':
+        // delete의 역은 이전 값으로 set
+        return {
+          ...op,
+          type: 'map_set',
+          value: op.previousValue,
+          previousValue: undefined
+        };
+
+      case 'rga_insert':
+        // insert의 역은 delete
+        return {
+          ...op,
+          type: 'rga_delete'
+        };
+
+      case 'rga_delete':
+        // delete의 역은 insert
+        return {
+          ...op,
+          type: 'rga_insert',
+          value: op.deletedValue
+        };
+
+      case 'lwwset_add':
+        // add의 역은 remove
+        return {
+          ...op,
+          type: 'lwwset_remove',
+          removeTime: op.addTime + 1
+        };
+
+      case 'lwwset_remove':
+        // remove의 역은 add
+        return {
+          ...op,
+          type: 'lwwset_add',
+          addTime: op.removeTime + 1
+        };
+
+      case 'rich_format':
+        // format의 역은 이전 format으로 복원
+        return {
+          ...op,
+          format: op.previousFormat || {}
+        };
+
+      default:
+        return null;
+    }
+  }
+
+  // Op 캡처 (tracked path인지 확인)
+  capture(op, previousValue) {
+    // 특정 path만 추적하는 경우
+    if (this.trackedPaths && op.path) {
+      const pathStr = Array.isArray(op.path) ? op.path[0] : op.path.split('.')[0];
+      if (!this.trackedPaths.includes(pathStr)) return;
+    }
+
+    // 이전 값 저장
+    const opWithPrev = { ...op, previousValue };
+
+    this.pendingOps.push(opWithPrev);
+    this.redoStack = []; // 새 작업 시 redo 스택 클리어
+
+    // 500ms 내 연속 입력은 하나의 undo 단위로 묶음
+    if (this.pendingTimer) {
+      clearTimeout(this.pendingTimer);
+    }
+    this.pendingTimer = setTimeout(() => this._flushPending(), this.captureTimeout);
+  }
+
+  _flushPending() {
+    if (this.pendingOps.length === 0) return;
+
+    const ops = this.pendingOps;
+    const inverseOps = ops.map(op => this.invertOp(op)).filter(Boolean).reverse();
+
+    this.undoStack.push({
+      ops,
+      inverseOps,
+      timestamp: Date.now()
+    });
+
+    // 최대 히스토리 유지
+    if (this.undoStack.length > this.maxHistory) {
+      this.undoStack.shift();
+    }
+
+    this.pendingOps = [];
+    this.pendingTimer = null;
+  }
+
+  // Undo 가능 여부
+  canUndo() {
+    this._flushPending();
+    return this.undoStack.length > 0;
+  }
+
+  // Redo 가능 여부
+  canRedo() {
+    return this.redoStack.length > 0;
+  }
+
+  // Undo 실행 - 역연산 ops 반환
+  undo() {
+    this._flushPending();
+
+    if (this.undoStack.length === 0) return null;
+
+    const entry = this.undoStack.pop();
+    this.redoStack.push(entry);
+
+    return entry.inverseOps;
+  }
+
+  // Redo 실행 - 원래 ops 반환
+  redo() {
+    if (this.redoStack.length === 0) return null;
+
+    const entry = this.redoStack.pop();
+    this.undoStack.push(entry);
+
+    return entry.ops;
+  }
+
+  // 히스토리 클리어
+  clear() {
+    this.undoStack = [];
+    this.redoStack = [];
+    this.pendingOps = [];
+    if (this.pendingTimer) {
+      clearTimeout(this.pendingTimer);
+      this.pendingTimer = null;
+    }
+  }
+
+  // 상태
+  get state() {
+    return {
+      undoCount: this.undoStack.length,
+      redoCount: this.redoStack.length,
+      pendingCount: this.pendingOps.length
+    };
+  }
+
+  toJSON() {
+    this._flushPending();
+    return {
+      undoStack: this.undoStack,
+      redoStack: this.redoStack,
+      maxHistory: this.maxHistory,
+      captureTimeout: this.captureTimeout,
+      trackedPaths: this.trackedPaths
+    };
+  }
+
+  static fromJSON(j) {
+    const um = new UndoManager({
+      maxHistory: j.maxHistory,
+      captureTimeout: j.captureTimeout,
+      trackedPaths: j.trackedPaths
+    });
+    um.undoStack = j.undoStack || [];
+    um.redoStack = j.redoStack || [];
+    return um;
+  }
+}
+
+// ===== Presence Manager =====
+export class PresenceManager {
+  constructor(nodeId, options = {}) {
+    this.nodeId = nodeId;
+    this.heartbeatInterval = options.heartbeatInterval || 10000; // 10초
+    this.timeout = options.timeout || 30000; // 30초
+    this.users = new Map(); // nodeId -> { name, color, avatar, cursor, lastSeen, status }
+    this.localUser = {
+      name: options.name || nodeId.slice(0, 8),
+      color: options.color || this._generateColor(nodeId),
+      avatar: options.avatar || null,
+      status: 'online'
+    };
+  }
+
+  _generateColor(id) {
+    let hash = 0;
+    for (let i = 0; i < id.length; i++) {
+      hash = ((hash << 5) - hash) + id.charCodeAt(i);
+      hash |= 0;
+    }
+    const hue = Math.abs(hash) % 360;
+    return `hsl(${hue}, 70%, 50%)`;
+  }
+
+  // 로컬 유저 정보 설정
+  setLocalUser(info) {
+    this.localUser = { ...this.localUser, ...info };
+    return this.getPresenceUpdate();
+  }
+
+  // Presence 업데이트 메시지 생성
+  getPresenceUpdate() {
+    return {
+      type: 'presence_update',
+      nodeId: this.nodeId,
+      user: this.localUser,
+      timestamp: Date.now()
+    };
+  }
+
+  // 로컬 유저 나감 메시지
+  getPresenceLeave() {
+    return {
+      type: 'presence_leave',
+      nodeId: this.nodeId,
+      timestamp: Date.now()
+    };
+  }
+
+  // 원격 유저 업데이트 적용
+  applyRemote(msg) {
+    if (msg.type === 'presence_update') {
+      if (msg.nodeId === this.nodeId) return; // 자기 자신 무시
+
+      this.users.set(msg.nodeId, {
+        ...msg.user,
+        nodeId: msg.nodeId,
+        lastSeen: msg.timestamp
+      });
+    } else if (msg.type === 'presence_leave') {
+      this.users.delete(msg.nodeId);
+    }
+  }
+
+  // 커서 위치 업데이트
+  updateCursor(position, selection = null) {
+    this.localUser.cursor = { position, selection };
+    return {
+      type: 'presence_cursor',
+      nodeId: this.nodeId,
+      cursor: this.localUser.cursor,
+      timestamp: Date.now()
+    };
+  }
+
+  // 원격 커서 업데이트
+  applyRemoteCursor(msg) {
+    if (msg.nodeId === this.nodeId) return;
+
+    const user = this.users.get(msg.nodeId);
+    if (user) {
+      user.cursor = msg.cursor;
+      user.lastSeen = msg.timestamp;
+    }
+  }
+
+  // 타임아웃된 유저 정리
+  cleanup() {
+    const now = Date.now();
+    const removed = [];
+
+    for (const [nodeId, user] of this.users) {
+      if (now - user.lastSeen > this.timeout) {
+        this.users.delete(nodeId);
+        removed.push(nodeId);
+      }
+    }
+
+    return removed;
+  }
+
+  // 온라인 유저 목록
+  getOnlineUsers() {
+    this.cleanup();
+    const users = [];
+
+    // 자기 자신 포함
+    users.push({
+      nodeId: this.nodeId,
+      ...this.localUser,
+      isLocal: true
+    });
+
+    // 원격 유저
+    for (const [nodeId, user] of this.users) {
+      users.push({
+        nodeId,
+        ...user,
+        isLocal: false
+      });
+    }
+
+    return users;
+  }
+
+  // 특정 유저 정보
+  getUser(nodeId) {
+    if (nodeId === this.nodeId) {
+      return { nodeId: this.nodeId, ...this.localUser, isLocal: true };
+    }
+    return this.users.get(nodeId);
+  }
+
+  // 유저 수
+  get count() {
+    this.cleanup();
+    return this.users.size + 1; // 자기 자신 포함
+  }
+
+  toJSON() {
+    const users = {};
+    for (const [k, v] of this.users) users[k] = v;
+    return {
+      nodeId: this.nodeId,
+      localUser: this.localUser,
+      users,
+      heartbeatInterval: this.heartbeatInterval,
+      timeout: this.timeout
+    };
+  }
+
+  static fromJSON(j) {
+    const pm = new PresenceManager(j.nodeId, {
+      heartbeatInterval: j.heartbeatInterval,
+      timeout: j.timeout,
+      name: j.localUser.name,
+      color: j.localUser.color,
+      avatar: j.localUser.avatar
+    });
+    pm.localUser = j.localUser;
+    for (const [k, v] of Object.entries(j.users || {})) {
+      pm.users.set(k, v);
+    }
+    return pm;
+  }
+}
+
 // ===== Export =====
 export default {
   VectorClock,
@@ -1295,5 +1665,7 @@ export default {
   CursorManager,
   OpBatcher,
   SnapshotManager,
-  CRDTDocument
+  CRDTDocument,
+  UndoManager,
+  PresenceManager
 };

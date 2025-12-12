@@ -25,12 +25,14 @@ import {
   CRDTDocument,
   OpBatcher,
   SnapshotManager,
-  LWWMap
+  LWWMap,
+  UndoManager,
+  PresenceManager
 } from "./crdt/v2/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 40000;
-const VERSION = "5.0.0";
+const VERSION = "5.1.0";
 const API_KEY = process.env.KIMDB_API_KEY || "kimdb-dev-key-2025";
 
 const DB_DIR = join(__dirname, "..", "shared_database");
@@ -63,6 +65,35 @@ const metrics = {
 // ===== WebSocket 클라이언트 관리 =====
 const clients = new Map(); // clientId -> { socket, subscriptions: Set<collection>, clock: VectorClock }
 const subscriptions = new Map(); // collection -> Set<clientId>
+
+// ===== Presence 관리 =====
+const presenceManagers = new Map(); // collection:docId -> PresenceManager
+const clientPresence = new Map(); // clientId -> { collection, docId, nodeId }
+
+function getPresenceManager(collection, docId) {
+  const key = `${collection}:${docId}`;
+  if (!presenceManagers.has(key)) {
+    presenceManagers.set(key, new PresenceManager(`server_${key}`, {
+      heartbeatInterval: 10000,
+      timeout: 30000
+    }));
+  }
+  return presenceManagers.get(key);
+}
+
+// ===== Undo 매니저 관리 (클라이언트별) =====
+const clientUndoManagers = new Map(); // clientId:collection:docId -> UndoManager
+
+function getClientUndoManager(clientId, collection, docId) {
+  const key = `${clientId}:${collection}:${docId}`;
+  if (!clientUndoManagers.has(key)) {
+    clientUndoManagers.set(key, new UndoManager({
+      maxHistory: 100,
+      captureTimeout: 500
+    }));
+  }
+  return clientUndoManagers.get(key);
+}
 
 // ===== CRDT 문서 관리 =====
 const crdtDocs = new Map(); // docId -> CRDTDocument
@@ -1199,6 +1230,386 @@ fastify.register(async function (fastify) {
             }
             break;
           }
+
+          // ===== Undo/Redo Operations =====
+          case "undo_capture": {
+            // Undo 스택에 작업 저장
+            try {
+              const { collection, docId, op, previousValue } = msg;
+              const undoMgr = getClientUndoManager(clientId, collection, docId);
+              undoMgr.capture(op, previousValue);
+              socket.send(JSON.stringify({
+                type: "undo_capture_ok",
+                state: undoMgr.state
+              }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
+
+          case "undo": {
+            // Undo 실행
+            try {
+              const { collection, docId } = msg;
+              const undoMgr = getClientUndoManager(clientId, collection, docId);
+              const inverseOps = undoMgr.undo();
+
+              if (!inverseOps || inverseOps.length === 0) {
+                socket.send(JSON.stringify({ type: "undo_empty" }));
+                break;
+              }
+
+              // 역연산 적용 - clock과 opId가 없으면 생성
+              const doc = getCRDTDoc(collection, docId);
+              for (const op of inverseOps) {
+                // clock이 없으면 현재 문서의 clock 사용
+                if (!op.clock) {
+                  op.clock = doc.clock.tick().toJSON();
+                }
+                // opId가 없으면 생성
+                if (!op.opId) {
+                  op.opId = `undo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+                }
+                doc.applyRemote(op);
+              }
+              saveCRDTToDB(collection, docId, doc);
+
+              // 브로드캐스트 (다른 클라이언트에게 역연산 전파)
+              const broadcastMsg = JSON.stringify({
+                type: "crdt_sync",
+                collection,
+                docId,
+                operations: inverseOps,
+                source: "undo",
+                serverTime: Date.now()
+              });
+
+              const subs = subscriptions.get(collection);
+              if (subs) {
+                for (const cid of subs) {
+                  if (cid === clientId) continue;
+                  const c = clients.get(cid);
+                  if (c && c.socket.readyState === 1) {
+                    c.socket.send(broadcastMsg);
+                  }
+                }
+              }
+
+              socket.send(JSON.stringify({
+                type: "undo_ok",
+                docId,
+                operations: inverseOps,
+                state: undoMgr.state,
+                docVersion: doc.version
+              }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
+
+          case "redo": {
+            // Redo 실행
+            try {
+              const { collection, docId } = msg;
+              const undoMgr = getClientUndoManager(clientId, collection, docId);
+              const ops = undoMgr.redo();
+
+              if (!ops || ops.length === 0) {
+                socket.send(JSON.stringify({ type: "redo_empty" }));
+                break;
+              }
+
+              // 원래 작업 재적용 - clock과 opId가 없으면 생성
+              const doc = getCRDTDoc(collection, docId);
+              for (const op of ops) {
+                if (!op.clock) {
+                  op.clock = doc.clock.tick().toJSON();
+                }
+                if (!op.opId) {
+                  op.opId = `redo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+                }
+                doc.applyRemote(op);
+              }
+              saveCRDTToDB(collection, docId, doc);
+
+              // 브로드캐스트
+              const broadcastMsg = JSON.stringify({
+                type: "crdt_sync",
+                collection,
+                docId,
+                operations: ops,
+                source: "redo",
+                serverTime: Date.now()
+              });
+
+              const subs = subscriptions.get(collection);
+              if (subs) {
+                for (const cid of subs) {
+                  if (cid === clientId) continue;
+                  const c = clients.get(cid);
+                  if (c && c.socket.readyState === 1) {
+                    c.socket.send(broadcastMsg);
+                  }
+                }
+              }
+
+              socket.send(JSON.stringify({
+                type: "redo_ok",
+                docId,
+                operations: ops,
+                state: undoMgr.state,
+                docVersion: doc.version
+              }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
+
+          case "undo_state": {
+            // Undo/Redo 상태 조회
+            try {
+              const { collection, docId } = msg;
+              const undoMgr = getClientUndoManager(clientId, collection, docId);
+              socket.send(JSON.stringify({
+                type: "undo_state",
+                docId,
+                canUndo: undoMgr.canUndo(),
+                canRedo: undoMgr.canRedo(),
+                state: undoMgr.state
+              }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
+
+          case "undo_clear": {
+            // Undo 히스토리 클리어
+            try {
+              const { collection, docId } = msg;
+              const undoMgr = getClientUndoManager(clientId, collection, docId);
+              undoMgr.clear();
+              socket.send(JSON.stringify({ type: "undo_clear_ok" }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
+
+          // ===== Presence Operations =====
+          case "presence_join": {
+            // 문서에 참여 (Presence 시작)
+            try {
+              const { collection, docId, user } = msg;
+              const pm = getPresenceManager(collection, docId);
+
+              // 클라이언트 presence 정보 저장
+              const nodeId = `client_${clientId}`;
+              clientPresence.set(clientId, { collection, docId, nodeId });
+
+              // 유저 정보 추가
+              pm.users.set(nodeId, {
+                ...user,
+                nodeId,
+                lastSeen: Date.now()
+              });
+
+              // 현재 온라인 유저 목록 전송
+              const onlineUsers = [];
+              for (const [nid, u] of pm.users) {
+                onlineUsers.push({ nodeId: nid, ...u });
+              }
+
+              // 다른 클라이언트들에게 알림
+              const joinMsg = JSON.stringify({
+                type: "presence_joined",
+                collection,
+                docId,
+                user: { nodeId, ...user },
+                timestamp: Date.now()
+              });
+
+              const subs = subscriptions.get(collection);
+              if (subs) {
+                for (const cid of subs) {
+                  if (cid === clientId) continue;
+                  const c = clients.get(cid);
+                  if (c && c.socket.readyState === 1) {
+                    c.socket.send(joinMsg);
+                  }
+                }
+              }
+
+              socket.send(JSON.stringify({
+                type: "presence_join_ok",
+                nodeId,
+                users: onlineUsers
+              }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
+
+          case "presence_update": {
+            // Presence 업데이트 (heartbeat 포함)
+            try {
+              const { collection, docId, user, cursor } = msg;
+              const pm = getPresenceManager(collection, docId);
+              const presence = clientPresence.get(clientId);
+
+              if (!presence) {
+                socket.send(JSON.stringify({ type: "error", message: "Not joined" }));
+                break;
+              }
+
+              const userInfo = pm.users.get(presence.nodeId);
+              if (userInfo) {
+                Object.assign(userInfo, user, { cursor, lastSeen: Date.now() });
+              }
+
+              // 브로드캐스트
+              const updateMsg = JSON.stringify({
+                type: "presence_updated",
+                collection,
+                docId,
+                nodeId: presence.nodeId,
+                user: { ...userInfo },
+                timestamp: Date.now()
+              });
+
+              const subs = subscriptions.get(collection);
+              if (subs) {
+                for (const cid of subs) {
+                  if (cid === clientId) continue;
+                  const c = clients.get(cid);
+                  if (c && c.socket.readyState === 1) {
+                    c.socket.send(updateMsg);
+                  }
+                }
+              }
+
+              socket.send(JSON.stringify({ type: "presence_update_ok" }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
+
+          case "presence_cursor": {
+            // 커서 위치만 업데이트 (고빈도)
+            try {
+              const { collection, docId, position, selection } = msg;
+              const pm = getPresenceManager(collection, docId);
+              const presence = clientPresence.get(clientId);
+
+              if (!presence) break;
+
+              const userInfo = pm.users.get(presence.nodeId);
+              if (userInfo) {
+                userInfo.cursor = { position, selection };
+                userInfo.lastSeen = Date.now();
+              }
+
+              // 커서는 즉시 브로드캐스트 (batching 없음)
+              const cursorMsg = JSON.stringify({
+                type: "presence_cursor_moved",
+                collection,
+                docId,
+                nodeId: presence.nodeId,
+                cursor: { position, selection },
+                timestamp: Date.now()
+              });
+
+              const subs = subscriptions.get(collection);
+              if (subs) {
+                for (const cid of subs) {
+                  if (cid === clientId) continue;
+                  const c = clients.get(cid);
+                  if (c && c.socket.readyState === 1) {
+                    c.socket.send(cursorMsg);
+                  }
+                }
+              }
+            } catch (e) {
+              // 커서 업데이트 실패는 무시 (고빈도 작업)
+            }
+            break;
+          }
+
+          case "presence_leave": {
+            // 문서에서 나가기
+            try {
+              const { collection, docId } = msg;
+              const pm = getPresenceManager(collection, docId);
+              const presence = clientPresence.get(clientId);
+
+              if (presence) {
+                pm.users.delete(presence.nodeId);
+                clientPresence.delete(clientId);
+
+                // 브로드캐스트
+                const leaveMsg = JSON.stringify({
+                  type: "presence_left",
+                  collection,
+                  docId,
+                  nodeId: presence.nodeId,
+                  timestamp: Date.now()
+                });
+
+                const subs = subscriptions.get(collection);
+                if (subs) {
+                  for (const cid of subs) {
+                    if (cid === clientId) continue;
+                    const c = clients.get(cid);
+                    if (c && c.socket.readyState === 1) {
+                      c.socket.send(leaveMsg);
+                    }
+                  }
+                }
+              }
+
+              socket.send(JSON.stringify({ type: "presence_leave_ok" }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
+
+          case "presence_get": {
+            // 현재 접속자 목록 조회
+            try {
+              const { collection, docId } = msg;
+              const pm = getPresenceManager(collection, docId);
+
+              // 타임아웃된 유저 정리
+              const now = Date.now();
+              for (const [nodeId, user] of pm.users) {
+                if (now - user.lastSeen > pm.timeout) {
+                  pm.users.delete(nodeId);
+                }
+              }
+
+              const users = [];
+              for (const [nodeId, user] of pm.users) {
+                users.push({ nodeId, ...user });
+              }
+
+              socket.send(JSON.stringify({
+                type: "presence_users",
+                collection,
+                docId,
+                users,
+                count: users.length
+              }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
         }
       } catch (e) {
         socket.send(JSON.stringify({ type: "error", message: e.message }));
@@ -1219,6 +1630,40 @@ fastify.register(async function (fastify) {
       if (batcher) {
         batcher.flush(); // 남은 ops 전송
         clientBatchers.delete(clientId);
+      }
+
+      // Presence 정리 - 연결 종료 시 자동으로 나감 처리
+      const presence = clientPresence.get(clientId);
+      if (presence) {
+        const pm = getPresenceManager(presence.collection, presence.docId);
+        pm.users.delete(presence.nodeId);
+        clientPresence.delete(clientId);
+
+        // 다른 클라이언트들에게 나감 알림
+        const leaveMsg = JSON.stringify({
+          type: "presence_left",
+          collection: presence.collection,
+          docId: presence.docId,
+          nodeId: presence.nodeId,
+          timestamp: Date.now()
+        });
+
+        const subs = subscriptions.get(presence.collection);
+        if (subs) {
+          for (const cid of subs) {
+            const c = clients.get(cid);
+            if (c && c.socket.readyState === 1) {
+              c.socket.send(leaveMsg);
+            }
+          }
+        }
+      }
+
+      // Undo 매니저 정리
+      for (const key of clientUndoManagers.keys()) {
+        if (key.startsWith(`${clientId}:`)) {
+          clientUndoManagers.delete(key);
+        }
       }
 
       metrics.websocket.connections--;

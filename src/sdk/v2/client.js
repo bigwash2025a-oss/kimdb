@@ -1,11 +1,13 @@
 /**
- * kimdb Client SDK v2.0.0
+ * kimdb Client SDK v2.1.0
  *
  * Production-ready CRDT 클라이언트
  * - LWW-Set, 3-way merge
  * - Op batching + delta compression
  * - Snapshot 기반 초기 로드
  * - Rich Text + Collaborative Cursor
+ * - Undo/Redo (Op Inversion)
+ * - Presence (실시간 접속자 + 아바타)
  * - 자동 충돌 해결 (UI 팝업 없음)
  *
  * 브라우저/React Native/Node.js 호환
@@ -168,7 +170,25 @@ class KimDBClient {
       disconnect: [],
       change: [],
       cursor: [],
+      presence: [],
+      undo: [],
       error: []
+    };
+
+    // Undo/Redo 상태 (클라이언트별)
+    this.undoState = new Map(); // collection:docId -> { canUndo, canRedo, undoCount, redoCount }
+
+    // Presence 상태
+    this.presence = {
+      nodeId: null,
+      users: new Map(), // collection:docId -> Map<nodeId, user>
+      localUser: {
+        name: options.userName || this.nodeId.slice(0, 8),
+        color: options.userColor || this._generateColor(this.nodeId),
+        avatar: options.avatar || null,
+        status: 'online'
+      },
+      heartbeatTimer: null
     };
 
     // 스토리지
@@ -271,18 +291,6 @@ class KimDBClient {
     }, delay);
   }
 
-  disconnect() {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
-    this.connected = false;
-  }
-
   // ===== 메시지 처리 =====
   _send(msg) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -346,11 +354,182 @@ class KimDBClient {
         this._loadSnapshot(msg.collection, msg.docId, msg.state, msg.version);
         break;
 
+      // ===== Undo/Redo 메시지 =====
+      case 'undo_capture_ok':
+        this._updateUndoState(msg);
+        break;
+
+      case 'undo_ok':
+        this._handleUndoOk(msg);
+        break;
+
+      case 'redo_ok':
+        this._handleRedoOk(msg);
+        break;
+
+      case 'undo_empty':
+      case 'redo_empty':
+        this._emit('undo', { type: msg.type, empty: true });
+        break;
+
+      case 'undo_state':
+        this._updateUndoState(msg);
+        this._emit('undo', { type: 'state', ...msg });
+        break;
+
+      case 'undo_clear_ok':
+        break;
+
+      // ===== Presence 메시지 =====
+      case 'presence_join_ok':
+        this.presence.nodeId = msg.nodeId;
+        this._handlePresenceUsers(msg.users);
+        this._emit('presence', { type: 'joined', nodeId: msg.nodeId, users: msg.users });
+        break;
+
+      case 'presence_joined':
+        this._handlePresenceJoined(msg);
+        break;
+
+      case 'presence_updated':
+        this._handlePresenceUpdated(msg);
+        break;
+
+      case 'presence_cursor_moved':
+        this._handlePresenceCursor(msg);
+        break;
+
+      case 'presence_left':
+        this._handlePresenceLeft(msg);
+        break;
+
+      case 'presence_users':
+        this._handlePresenceUsers(msg.users, msg.collection, msg.docId);
+        this._emit('presence', { type: 'users', collection: msg.collection, docId: msg.docId, users: msg.users, count: msg.count });
+        break;
+
+      case 'presence_update_ok':
+      case 'presence_leave_ok':
+        break;
+
       case 'error':
         console.error('[kimdb] Server error:', msg.message);
         this._emit('error', { message: msg.message });
         break;
     }
+  }
+
+  // ===== Undo/Redo 핸들러 =====
+  _updateUndoState(msg) {
+    if (msg.state) {
+      const key = msg.docId || 'global';
+      this.undoState.set(key, {
+        canUndo: msg.state.undoCount > 0,
+        canRedo: msg.state.redoCount > 0,
+        undoCount: msg.state.undoCount,
+        redoCount: msg.state.redoCount
+      });
+    }
+  }
+
+  _handleUndoOk(msg) {
+    this._updateUndoState(msg);
+
+    // 로컬 문서 업데이트
+    if (msg.operations && msg.docId) {
+      // 서버에서 적용했으므로 로컬에도 적용 필요 없음 (crdt_sync로 올 것)
+    }
+
+    this._emit('undo', {
+      type: 'undo',
+      docId: msg.docId,
+      operations: msg.operations,
+      docVersion: msg.docVersion,
+      state: msg.state
+    });
+  }
+
+  _handleRedoOk(msg) {
+    this._updateUndoState(msg);
+
+    this._emit('undo', {
+      type: 'redo',
+      docId: msg.docId,
+      operations: msg.operations,
+      docVersion: msg.docVersion,
+      state: msg.state
+    });
+  }
+
+  // ===== Presence 핸들러 =====
+  _handlePresenceUsers(users, collection, docId) {
+    const key = collection && docId ? `${collection}:${docId}` : 'global';
+    if (!this.presence.users.has(key)) {
+      this.presence.users.set(key, new Map());
+    }
+    const usersMap = this.presence.users.get(key);
+    usersMap.clear();
+    for (const user of users) {
+      usersMap.set(user.nodeId, user);
+    }
+  }
+
+  _handlePresenceJoined(msg) {
+    const key = `${msg.collection}:${msg.docId}`;
+    if (!this.presence.users.has(key)) {
+      this.presence.users.set(key, new Map());
+    }
+    this.presence.users.get(key).set(msg.user.nodeId, msg.user);
+    this._emit('presence', {
+      type: 'joined',
+      collection: msg.collection,
+      docId: msg.docId,
+      user: msg.user
+    });
+  }
+
+  _handlePresenceUpdated(msg) {
+    const key = `${msg.collection}:${msg.docId}`;
+    if (this.presence.users.has(key)) {
+      this.presence.users.get(key).set(msg.nodeId, msg.user);
+    }
+    this._emit('presence', {
+      type: 'updated',
+      collection: msg.collection,
+      docId: msg.docId,
+      nodeId: msg.nodeId,
+      user: msg.user
+    });
+  }
+
+  _handlePresenceCursor(msg) {
+    const key = `${msg.collection}:${msg.docId}`;
+    if (this.presence.users.has(key)) {
+      const user = this.presence.users.get(key).get(msg.nodeId);
+      if (user) {
+        user.cursor = msg.cursor;
+      }
+    }
+    this._emit('presence', {
+      type: 'cursor',
+      collection: msg.collection,
+      docId: msg.docId,
+      nodeId: msg.nodeId,
+      cursor: msg.cursor
+    });
+  }
+
+  _handlePresenceLeft(msg) {
+    const key = `${msg.collection}:${msg.docId}`;
+    if (this.presence.users.has(key)) {
+      this.presence.users.get(key).delete(msg.nodeId);
+    }
+    this._emit('presence', {
+      type: 'left',
+      collection: msg.collection,
+      docId: msg.docId,
+      nodeId: msg.nodeId
+    });
   }
 
   _loadSnapshot(collection, docId, state, version) {
@@ -746,6 +925,196 @@ class KimDBClient {
     return doc.getRemoteCursors();
   }
 
+  // ===== Undo/Redo API =====
+
+  /**
+   * 작업을 Undo 스택에 저장 (자동으로 호출됨, 필요시 수동 호출)
+   */
+  captureUndo(collection, docId, op, previousValue = null) {
+    if (this.connected) {
+      this._send({
+        type: 'undo_capture',
+        collection,
+        docId,
+        op,
+        previousValue
+      });
+    }
+  }
+
+  /**
+   * Undo 실행
+   */
+  undo(collection, docId) {
+    if (this.connected) {
+      this._send({ type: 'undo', collection, docId });
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Redo 실행
+   */
+  redo(collection, docId) {
+    if (this.connected) {
+      this._send({ type: 'redo', collection, docId });
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Undo/Redo 상태 조회
+   */
+  getUndoState(collection, docId) {
+    const key = docId || 'global';
+    const state = this.undoState.get(key);
+    if (state) return state;
+
+    // 서버에서 최신 상태 요청
+    if (this.connected) {
+      this._send({ type: 'undo_state', collection, docId });
+    }
+
+    return { canUndo: false, canRedo: false, undoCount: 0, redoCount: 0 };
+  }
+
+  /**
+   * Undo 가능 여부
+   */
+  canUndo(collection, docId) {
+    return this.getUndoState(collection, docId).canUndo;
+  }
+
+  /**
+   * Redo 가능 여부
+   */
+  canRedo(collection, docId) {
+    return this.getUndoState(collection, docId).canRedo;
+  }
+
+  /**
+   * Undo 히스토리 클리어
+   */
+  clearUndoHistory(collection, docId) {
+    if (this.connected) {
+      this._send({ type: 'undo_clear', collection, docId });
+    }
+    this.undoState.delete(docId || 'global');
+  }
+
+  // ===== Presence API =====
+
+  /**
+   * 문서에 참여 (Presence 시작)
+   * @param {string} collection
+   * @param {string} docId
+   * @param {object} userInfo - { name, color, avatar }
+   */
+  joinPresence(collection, docId, userInfo = {}) {
+    const user = {
+      ...this.presence.localUser,
+      ...userInfo
+    };
+
+    if (this.connected) {
+      this._send({
+        type: 'presence_join',
+        collection,
+        docId,
+        user
+      });
+
+      // Heartbeat 시작 (10초마다)
+      if (this.presence.heartbeatTimer) {
+        clearInterval(this.presence.heartbeatTimer);
+      }
+      this.presence.heartbeatTimer = setInterval(() => {
+        this._send({
+          type: 'presence_update',
+          collection,
+          docId,
+          user: this.presence.localUser
+        });
+      }, 10000);
+    }
+
+    return this;
+  }
+
+  /**
+   * 문서에서 나가기
+   */
+  leavePresence(collection, docId) {
+    if (this.presence.heartbeatTimer) {
+      clearInterval(this.presence.heartbeatTimer);
+      this.presence.heartbeatTimer = null;
+    }
+
+    if (this.connected) {
+      this._send({ type: 'presence_leave', collection, docId });
+    }
+
+    const key = `${collection}:${docId}`;
+    this.presence.users.delete(key);
+
+    return this;
+  }
+
+  /**
+   * 커서 위치 업데이트 (Presence)
+   */
+  updatePresenceCursor(collection, docId, position, selection = null) {
+    if (this.connected) {
+      this._send({
+        type: 'presence_cursor',
+        collection,
+        docId,
+        position,
+        selection
+      });
+    }
+  }
+
+  /**
+   * 현재 접속자 목록 조회
+   */
+  getPresenceUsers(collection, docId) {
+    const key = `${collection}:${docId}`;
+    const usersMap = this.presence.users.get(key);
+    if (!usersMap) {
+      // 서버에서 요청
+      if (this.connected) {
+        this._send({ type: 'presence_get', collection, docId });
+      }
+      return [];
+    }
+    return [...usersMap.values()];
+  }
+
+  /**
+   * 접속자 수
+   */
+  getPresenceCount(collection, docId) {
+    return this.getPresenceUsers(collection, docId).length;
+  }
+
+  /**
+   * 로컬 유저 정보 설정
+   */
+  setLocalUser(info) {
+    this.presence.localUser = { ...this.presence.localUser, ...info };
+    return this.presence.localUser;
+  }
+
+  /**
+   * 로컬 유저 정보 조회
+   */
+  getLocalUser() {
+    return { ...this.presence.localUser, nodeId: this.presence.nodeId };
+  }
+
   // === 상태 ===
   get status() {
     return {
@@ -754,7 +1123,9 @@ class KimDBClient {
       clientId: this.clientId,
       queueSize: this.offlineQueue.length,
       documentsCount: this.documents.size,
-      subscriptions: [...this.subscriptions]
+      subscriptions: [...this.subscriptions],
+      presenceNodeId: this.presence.nodeId,
+      presenceUsers: this.presence.users.size
     };
   }
 
@@ -763,6 +1134,25 @@ class KimDBClient {
     await this.storage.clear();
     this.documents.clear();
     this.offlineQueue = [];
+    this.undoState.clear();
+  }
+
+  disconnect() {
+    // Presence 정리
+    if (this.presence.heartbeatTimer) {
+      clearInterval(this.presence.heartbeatTimer);
+      this.presence.heartbeatTimer = null;
+    }
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+    this.connected = false;
   }
 }
 
