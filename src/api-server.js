@@ -1,15 +1,14 @@
 /**
- * kimdb v4.0.0 - Real-time Database with Full CRDT
+ * kimdb v5.0.0 - Production-Ready Real-time Database
  *
  * 외부 의존: fastify, @fastify/cors, @fastify/websocket, better-sqlite3
  *
  * 특징:
- * - WebSocket 실시간 동기화
- * - 변경사항 브로드캐스트
- * - 구독 기반 데이터 스트리밍
- * - 클라이언트 SDK 지원
- * - Full CRDT 엔진 (Vector Clock, RGA, OR-Set)
- * - Op-based 동기화 (인과적 순서 보장)
+ * - CRDT v2 엔진 (LWW-Set, 3-way merge, Rich Text)
+ * - Op batching + Delta compression
+ * - Snapshot 기반 초기 로드
+ * - Collaborative Cursor
+ * - 자동 충돌 해결 (UI 팝업 없음)
  * - 100만 유저 대응 설계
  */
 
@@ -21,11 +20,17 @@ import crypto from "crypto";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { mkdirSync, existsSync, readdirSync, statSync, unlinkSync } from "fs";
-import { VectorClock, CRDTDocument, ConflictResolver } from "./crdt/index.js";
+import {
+  VectorClock,
+  CRDTDocument,
+  OpBatcher,
+  SnapshotManager,
+  LWWMap
+} from "./crdt/v2/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 40000;
-const VERSION = "4.0.0";
+const VERSION = "5.0.0";
 const API_KEY = process.env.KIMDB_API_KEY || "kimdb-dev-key-2025";
 
 const DB_DIR = join(__dirname, "..", "shared_database");
@@ -61,10 +66,32 @@ const subscriptions = new Map(); // collection -> Set<clientId>
 
 // ===== CRDT 문서 관리 =====
 const crdtDocs = new Map(); // docId -> CRDTDocument
-const conflictResolver = new ConflictResolver();
+const docSnapshots = new Map(); // docId -> SnapshotManager
 
 // 서버 노드 ID
 const SERVER_NODE_ID = `server_${crypto.randomBytes(4).toString("hex")}`;
+
+// Op Batcher (클라이언트별)
+const clientBatchers = new Map(); // clientId -> OpBatcher
+
+function getOpBatcher(clientId, socket) {
+  if (!clientBatchers.has(clientId)) {
+    clientBatchers.set(clientId, new OpBatcher({
+      batchSize: 50,
+      batchTimeout: 100,
+      onFlush: (ops) => {
+        if (socket.readyState === 1) {
+          socket.send(JSON.stringify({
+            type: 'batch_ops',
+            ops: OpBatcher.serialize(ops),
+            timestamp: Date.now()
+          }));
+        }
+      }
+    }));
+  }
+  return clientBatchers.get(clientId);
+}
 
 function getCRDTDoc(collection, docId) {
   const key = `${collection}:${docId}`;
@@ -123,7 +150,7 @@ function broadcast(collection, event, data, excludeClient = null) {
   const message = JSON.stringify({
     type: "sync",
     collection,
-    event, // "insert", "update", "delete"
+    event,
     data,
     timestamp: Date.now()
   });
@@ -139,6 +166,41 @@ function broadcast(collection, event, data, excludeClient = null) {
 
   metrics.websocket.broadcasts++;
   return count;
+}
+
+// Op batching을 사용한 브로드캐스트
+function broadcastOp(collection, op, excludeClient = null) {
+  const subs = subscriptions.get(collection);
+  if (!subs) return 0;
+
+  let count = 0;
+  for (const clientId of subs) {
+    if (clientId === excludeClient) continue;
+    const client = clients.get(clientId);
+    if (client && client.socket.readyState === 1) {
+      const batcher = getOpBatcher(clientId, client.socket);
+      batcher.add(op);
+      count++;
+    }
+  }
+
+  metrics.websocket.broadcasts++;
+  return count;
+}
+
+// Snapshot 기반 초기 로드
+function getDocWithSnapshot(collection, docId) {
+  const doc = getCRDTDoc(collection, docId);
+  const key = `${collection}:${docId}`;
+
+  if (!docSnapshots.has(key)) {
+    docSnapshots.set(key, new SnapshotManager({ snapshotInterval: 500 }));
+  }
+
+  const sm = docSnapshots.get(key);
+  const snapshot = sm.getLatestSnapshot();
+
+  return { doc, snapshot, snapshotManager: sm };
 }
 
 // ===== 테이블 자동 생성 =====
@@ -931,23 +993,206 @@ fastify.register(async function (fastify) {
             break;
           }
 
-          case "get_conflicts": {
-            // 미해결 충돌 목록
-            const pending = conflictResolver.getPendingConflicts();
-            socket.send(JSON.stringify({
-              type: "conflicts",
-              conflicts: pending
-            }));
+          // ===== v5.0.0 Features =====
+          case "get_snapshot": {
+            // Snapshot 기반 초기 로드
+            try {
+              const { collection, docId } = msg;
+              const { doc, snapshot, snapshotManager } = getDocWithSnapshot(collection, docId);
+
+              socket.send(JSON.stringify({
+                type: "snapshot",
+                collection,
+                docId,
+                snapshot: snapshot ? snapshot.state : doc.toJSON(),
+                version: snapshot ? snapshot.version : doc.version,
+                timestamp: Date.now()
+              }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
             break;
           }
 
-          case "resolve_conflict": {
-            // 충돌 수동 해결
+          case "rich_insert": {
+            // Rich Text 삽입
             try {
-              const result = conflictResolver.resolveManual(msg.conflictId, msg.choice);
+              const { collection, docId, path, index, char, format } = msg;
+              const doc = getCRDTDoc(collection, docId);
+              const op = doc.richInsert(path, index, char, format || {});
+              saveCRDTToDB(collection, docId, doc);
+              broadcastOp(collection, op, clientId);
+              socket.send(JSON.stringify({ type: "rich_insert_ok", docId, op }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
+
+          case "rich_delete": {
+            // Rich Text 삭제
+            try {
+              const { collection, docId, path, index } = msg;
+              const doc = getCRDTDoc(collection, docId);
+              const op = doc.richDelete(path, index);
+              if (op) {
+                saveCRDTToDB(collection, docId, doc);
+                broadcastOp(collection, op, clientId);
+              }
+              socket.send(JSON.stringify({ type: "rich_delete_ok", docId, op }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
+
+          case "rich_format": {
+            // Rich Text 서식 적용
+            try {
+              const { collection, docId, path, start, end, format } = msg;
+              const doc = getCRDTDoc(collection, docId);
+              const ops = doc.richFormat(path, start, end, format);
+              saveCRDTToDB(collection, docId, doc);
+              for (const op of ops) broadcastOp(collection, op, clientId);
+              socket.send(JSON.stringify({ type: "rich_format_ok", docId, ops }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
+
+          case "rich_embed": {
+            // Rich Text 임베드 삽입
+            try {
+              const { collection, docId, path, index, embedType, embedData } = msg;
+              const doc = getCRDTDoc(collection, docId);
+              const op = doc.richInsertEmbed(path, index, embedType, embedData);
+              saveCRDTToDB(collection, docId, doc);
+              broadcastOp(collection, op, clientId);
+              socket.send(JSON.stringify({ type: "rich_embed_ok", docId, op }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
+
+          case "rich_get": {
+            // Rich Text Delta 가져오기
+            try {
+              const { collection, docId, path } = msg;
+              const doc = getCRDTDoc(collection, docId);
+              const delta = doc.richGetDelta(path);
+              const text = doc.richGetText(path);
+              socket.send(JSON.stringify({ type: "rich_data", docId, path, delta, text }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
+
+          case "cursor_update": {
+            // 커서 위치 업데이트
+            try {
+              const { collection, docId, position, selection, color, name } = msg;
+              const doc = getCRDTDoc(collection, docId);
+              const op = doc.setCursor(position, selection);
+              op.color = color;
+              op.name = name;
+
+              // 커서는 batching 없이 즉시 브로드캐스트
+              const cursorMsg = JSON.stringify({
+                type: "cursor_sync",
+                collection,
+                docId,
+                cursor: op
+              });
+
+              const subs = subscriptions.get(collection);
+              if (subs) {
+                for (const cid of subs) {
+                  if (cid === clientId) continue;
+                  const c = clients.get(cid);
+                  if (c && c.socket.readyState === 1) {
+                    c.socket.send(cursorMsg);
+                  }
+                }
+              }
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
+
+          case "get_cursors": {
+            // 현재 활성 커서들 가져오기
+            try {
+              const { collection, docId } = msg;
+              const doc = getCRDTDoc(collection, docId);
+              const cursors = doc.getRemoteCursors();
+              socket.send(JSON.stringify({ type: "cursors", collection, docId, cursors }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
+
+          case "set_add": {
+            // LWW-Set 추가
+            try {
+              const { collection, docId, path, value } = msg;
+              const doc = getCRDTDoc(collection, docId);
+              const op = doc.setAdd(path, value);
+              saveCRDTToDB(collection, docId, doc);
+              broadcastOp(collection, op, clientId);
+              socket.send(JSON.stringify({ type: "set_add_ok", docId, op }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
+
+          case "set_remove": {
+            // LWW-Set 제거
+            try {
+              const { collection, docId, path, value } = msg;
+              const doc = getCRDTDoc(collection, docId);
+              const op = doc.setRemove(path, value);
+              saveCRDTToDB(collection, docId, doc);
+              broadcastOp(collection, op, clientId);
+              socket.send(JSON.stringify({ type: "set_remove_ok", docId, op }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
+
+          case "set_get": {
+            // LWW-Set 조회
+            try {
+              const { collection, docId, path } = msg;
+              const doc = getCRDTDoc(collection, docId);
+              const values = doc.setGet(path);
+              socket.send(JSON.stringify({ type: "set_data", docId, path, values }));
+            } catch (e) {
+              socket.send(JSON.stringify({ type: "error", message: e.message }));
+            }
+            break;
+          }
+
+          case "merge_remote": {
+            // 3-way merge (오프라인 복귀 시)
+            try {
+              const { collection, docId, remoteState } = msg;
+              const doc = getCRDTDoc(collection, docId);
+              const remoteDoc = CRDTDocument.fromJSON(remoteState);
+              doc.merge(remoteDoc);
+              saveCRDTToDB(collection, docId, doc);
+
               socket.send(JSON.stringify({
-                type: "conflict_resolved",
-                result
+                type: "merge_ok",
+                docId,
+                state: doc.toJSON(),
+                version: doc.version
               }));
             } catch (e) {
               socket.send(JSON.stringify({ type: "error", message: e.message }));
@@ -968,6 +1213,14 @@ fastify.register(async function (fastify) {
         }
       }
       clients.delete(clientId);
+
+      // Op batcher 정리
+      const batcher = clientBatchers.get(clientId);
+      if (batcher) {
+        batcher.flush(); // 남은 ops 전송
+        clientBatchers.delete(clientId);
+      }
+
       metrics.websocket.connections--;
       console.log("[kimdb] WS disconnected:", clientId);
     });
