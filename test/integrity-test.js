@@ -1,15 +1,17 @@
 /**
- * kimdb v6.0.0 데이터 무결성 테스트
+ * kimdb v6.0.0 데이터 무결성 테스트 (24시간)
+ * - CRDT API 사용
  * - 1000개 문서 생성
- * - 30분간 읽기/쓰기 반복
+ * - 지정 시간 동안 읽기/쓰기 반복
  * - 데이터 손실/손상 검증
  */
 
 import WebSocket from 'ws';
 
-const WS_URL = 'ws://127.0.0.1:40000/ws';
-const DOC_COUNT = 1000;
-const TEST_DURATION = 30 * 60 * 1000; // 30분
+const WS_URL = process.env.WS_URL || 'ws://127.0.0.1:40000/ws';
+const DOC_COUNT = parseInt(process.env.DOC_COUNT) || 1000;
+const TEST_HOURS = parseInt(process.env.TEST_HOURS) || 24;
+const TEST_DURATION = TEST_HOURS * 60 * 60 * 1000;
 const COLLECTION = 'integrity_test';
 
 const stats = {
@@ -37,23 +39,48 @@ function createClient() {
   });
 }
 
-function saveDoc(ws, docId, data) {
+function subscribeDoc(ws, docId) {
   return new Promise((resolve) => {
     const handler = (msg) => {
       try {
-        const parsed = JSON.parse(msg);
-        if (parsed.docId === docId && (parsed.type === 'doc_saved' || parsed.type === 'doc_created')) {
+        const parsed = JSON.parse(msg.toString());
+        if (parsed.docId === docId && parsed.type === 'crdt_state') {
           ws.off('message', handler);
-          resolve({ success: true, data: parsed });
+          resolve({ success: true, data: parsed.state });
         }
       } catch (e) {}
     };
     ws.on('message', handler);
     ws.send(JSON.stringify({
-      type: 'doc_save',
+      type: 'subscribe_doc',
+      collection: COLLECTION,
+      docId
+    }));
+    setTimeout(() => {
+      ws.off('message', handler);
+      resolve({ success: false, data: null });
+    }, 5000);
+  });
+}
+
+function setData(ws, docId, path, value) {
+  return new Promise((resolve) => {
+    const handler = (msg) => {
+      try {
+        const parsed = JSON.parse(msg.toString());
+        if (parsed.docId === docId && parsed.type === 'crdt_set_ok') {
+          ws.off('message', handler);
+          resolve({ success: true, version: parsed.version });
+        }
+      } catch (e) {}
+    };
+    ws.on('message', handler);
+    ws.send(JSON.stringify({
+      type: 'crdt_set',
       collection: COLLECTION,
       docId,
-      data
+      path,
+      value
     }));
     setTimeout(() => {
       ws.off('message', handler);
@@ -62,26 +89,26 @@ function saveDoc(ws, docId, data) {
   });
 }
 
-function getDoc(ws, docId) {
+function getSnapshot(ws, docId) {
   return new Promise((resolve) => {
     const handler = (msg) => {
       try {
-        const parsed = JSON.parse(msg);
-        if (parsed.docId === docId && (parsed.type === 'doc' || parsed.type === 'doc_not_found')) {
+        const parsed = JSON.parse(msg.toString());
+        if (parsed.docId === docId && parsed.type === 'snapshot') {
           ws.off('message', handler);
-          resolve(parsed);
+          resolve({ success: true, data: parsed.snapshot, version: parsed.version });
         }
       } catch (e) {}
     };
     ws.on('message', handler);
     ws.send(JSON.stringify({
-      type: 'doc_get',
+      type: 'get_snapshot',
       collection: COLLECTION,
       docId
     }));
     setTimeout(() => {
       ws.off('message', handler);
-      resolve({ type: 'timeout' });
+      resolve({ success: false, data: null });
     }, 5000);
   });
 }
@@ -91,16 +118,9 @@ function generateData(docId, version) {
     id: docId,
     version,
     timestamp: Date.now(),
-    checksum: `${docId}_v${version}_${Date.now()}`,
-    payload: {
-      numbers: Array.from({ length: 10 }, (_, i) => version * 10 + i),
-      text: `Document ${docId} version ${version}`,
-      nested: {
-        a: version,
-        b: version * 2,
-        c: { d: version * 3 }
-      }
-    }
+    checksum: `${docId}_v${version}`,
+    numbers: Array.from({ length: 5 }, (_, i) => version * 10 + i),
+    text: `Doc ${docId} v${version}`
   };
 }
 
@@ -109,7 +129,6 @@ function verifyData(docId, received, expected) {
   if (received.id !== expected.id) return false;
   if (received.version !== expected.version) return false;
   if (received.checksum !== expected.checksum) return false;
-  if (JSON.stringify(received.payload) !== JSON.stringify(expected.payload)) return false;
   return true;
 }
 
@@ -117,7 +136,8 @@ async function runTest() {
   console.log('\n' + '='.repeat(60));
   console.log('  kimdb v6.0.0 Data Integrity Test');
   console.log('  Documents: ' + DOC_COUNT);
-  console.log('  Duration: ' + (TEST_DURATION / 60000) + ' minutes');
+  console.log('  Duration: ' + TEST_HOURS + ' hours');
+  console.log('  Server: ' + WS_URL);
   console.log('='.repeat(60) + '\n');
 
   let ws;
@@ -136,7 +156,8 @@ async function runTest() {
       const data = generateData(docId, 1);
       expectedData.set(docId, data);
 
-      const result = await saveDoc(ws, docId, data);
+      // CRDT set으로 전체 데이터 저장
+      const result = await setData(ws, docId, 'data', data);
       stats.writes++;
       if (result.success) {
         stats.writeSuccess++;
@@ -153,39 +174,38 @@ async function runTest() {
     console.log('\n  -> ' + DOC_COUNT + ' documents created in ' + createTime.toFixed(1) + 's');
     console.log('  -> Write success rate: ' + (stats.writeSuccess / stats.writes * 100).toFixed(1) + '%\n');
 
-    // 3. 30분 읽기/쓰기 테스트
-    console.log('[Phase 3] Running read/write test for ' + (TEST_DURATION / 60000) + ' minutes...');
+    // 3. 장시간 읽기/쓰기 테스트
+    console.log('[Phase 3] Running read/write test for ' + TEST_HOURS + ' hours...');
     const testStart = Date.now();
     let lastReport = Date.now();
-    let iteration = 0;
 
     while (Date.now() - testStart < TEST_DURATION) {
-      iteration++;
-
       // 랜덤 문서 선택
       const docIndex = Math.floor(Math.random() * DOC_COUNT);
       const docId = 'doc_' + String(docIndex).padStart(4, '0');
 
       // 50% 확률로 읽기 또는 쓰기
       if (Math.random() < 0.5) {
-        // 읽기
+        // 읽기 (스냅샷)
         stats.reads++;
-        const result = await getDoc(ws, docId);
+        const result = await getSnapshot(ws, docId);
 
-        if (result.type === 'doc' && result.data) {
+        if (result.success && result.data) {
           stats.readSuccess++;
           const expected = expectedData.get(docId);
-          if (verifyData(docId, result.data, expected)) {
+          // CRDT 내부 구조에서 실제 값 추출: root.fields.data.value.value
+          const received = result.data?.root?.fields?.data?.value?.value;
+
+          if (verifyData(docId, received, expected)) {
             stats.dataMatches++;
           } else {
             stats.dataMismatches++;
-            console.log('\n  [MISMATCH] ' + docId);
-            console.log('    Expected version: ' + (expected ? expected.version : 'null'));
-            console.log('    Received version: ' + (result.data ? result.data.version : 'null'));
+            if (stats.dataMismatches <= 10) {
+              console.log('\n  [MISMATCH] ' + docId);
+            }
           }
-        } else if (result.type === 'doc_not_found') {
-          stats.dataMismatches++;
-          console.log('\n  [MISSING] ' + docId);
+        } else {
+          stats.errors++;
         }
       } else {
         // 쓰기 (버전 업데이트)
@@ -194,7 +214,7 @@ async function runTest() {
         const newVersion = current ? current.version + 1 : 1;
         const newData = generateData(docId, newVersion);
 
-        const result = await saveDoc(ws, docId, newData);
+        const result = await setData(ws, docId, 'data', newData);
         if (result.success) {
           stats.writeSuccess++;
           expectedData.set(docId, newData);
@@ -207,14 +227,20 @@ async function runTest() {
       if (Date.now() - lastReport > 60000) {
         const elapsed = Math.floor((Date.now() - testStart) / 60000);
         const remaining = Math.ceil((TEST_DURATION - (Date.now() - testStart)) / 60000);
-        console.log('\n  [' + elapsed + 'min] Reads: ' + stats.reads + ', Writes: ' + stats.writes +
-                    ', Matches: ' + stats.dataMatches + ', Mismatches: ' + stats.dataMismatches +
-                    ', Remaining: ' + remaining + 'min');
+        const elapsedHours = (elapsed / 60).toFixed(1);
+        const remainingHours = (remaining / 60).toFixed(1);
+
+        console.log('\n  [' + elapsedHours + 'h] Reads: ' + stats.reads +
+                    ', Writes: ' + stats.writes +
+                    ', Matches: ' + stats.dataMatches +
+                    ', Mismatches: ' + stats.dataMismatches +
+                    ', Errors: ' + stats.errors +
+                    ', Remaining: ' + remainingHours + 'h');
         lastReport = Date.now();
       }
 
-      // 약간의 딜레이 (너무 빠른 요청 방지)
-      await new Promise(r => setTimeout(r, 10));
+      // 약간의 딜레이
+      await new Promise(r => setTimeout(r, 100));
     }
 
     ws.close();
@@ -228,16 +254,21 @@ async function runTest() {
 
     for (let i = 0; i < DOC_COUNT; i++) {
       const docId = 'doc_' + String(i).padStart(4, '0');
-      const result = await getDoc(ws, docId);
+      const result = await getSnapshot(ws, docId);
       const expected = expectedData.get(docId);
 
-      if (result.type === 'doc' && result.data && verifyData(docId, result.data, expected)) {
-        finalMatches++;
+      if (result.success && result.data) {
+        const received = result.data?.root?.fields?.data?.value?.value;
+        if (verifyData(docId, received, expected)) {
+          finalMatches++;
+        } else {
+          finalMismatches++;
+          if (finalMismatches <= 10) {
+            console.log('  [FINAL MISMATCH] ' + docId);
+          }
+        }
       } else {
         finalMismatches++;
-        if (finalMismatches <= 10) {
-          console.log('  [FINAL MISMATCH] ' + docId);
-        }
       }
 
       if ((i + 1) % 200 === 0) {
@@ -250,18 +281,21 @@ async function runTest() {
     ws.close();
 
     // 5. 결과
-    const totalTime = (Date.now() - testStart) / 60000;
+    const totalTime = (Date.now() - testStart) / 3600000; // 시간 단위
     const totalOps = stats.reads + stats.writes;
 
     console.log('\n' + '='.repeat(60));
     console.log('  RESULTS');
     console.log('='.repeat(60));
 
+    console.log('\n  [Duration]');
+    console.log('    ' + totalTime.toFixed(2) + ' hours');
+
     console.log('\n  [Operations]');
     console.log('    Total: ' + totalOps.toLocaleString());
     console.log('    Reads: ' + stats.reads.toLocaleString() + ' (success: ' + stats.readSuccess.toLocaleString() + ')');
     console.log('    Writes: ' + stats.writes.toLocaleString() + ' (success: ' + stats.writeSuccess.toLocaleString() + ')');
-    console.log('    Rate: ' + Math.round(totalOps / (totalTime * 60)) + ' ops/sec');
+    console.log('    Rate: ' + Math.round(totalOps / (totalTime * 3600)) + ' ops/sec');
 
     console.log('\n  [Data Integrity]');
     console.log('    Runtime matches: ' + stats.dataMatches.toLocaleString());

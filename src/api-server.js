@@ -1365,6 +1365,350 @@ fastify.get("/api/c/:collection/:id", async (req, reply) => {
   return { success: true, id: row.id, data: JSON.parse(row.data), _version: row._version };
 });
 
+// ===== SQL Engine =====
+/**
+ * SQL 엔진 - kimdb에서 SQL 쿼리 직접 실행
+ *
+ * 지원하는 쿼리:
+ * - SELECT * FROM table WHERE ... ORDER BY ... LIMIT ...
+ * - SELECT COUNT(*) FROM table WHERE ...
+ * - INSERT INTO table (col1, col2) VALUES (?, ?)
+ * - UPDATE table SET col1 = ? WHERE ...
+ * - DELETE FROM table WHERE ...
+ */
+
+function parseSql(sql, params = []) {
+  const sqlLower = sql.toLowerCase().trim();
+  const result = { type: null, table: null, columns: '*', where: [], orderBy: null, orderDir: 'ASC', limit: null, offset: null, values: {}, paramIndex: 0 };
+
+  // 쿼리 타입 판별
+  if (sqlLower.startsWith('select')) {
+    result.type = 'SELECT';
+  } else if (sqlLower.startsWith('insert')) {
+    result.type = 'INSERT';
+  } else if (sqlLower.startsWith('update')) {
+    result.type = 'UPDATE';
+  } else if (sqlLower.startsWith('delete')) {
+    result.type = 'DELETE';
+  } else {
+    throw new Error(`Unsupported SQL: ${sql}`);
+  }
+
+  // 테이블명 추출
+  const tableMatch = sqlLower.match(/(?:from|into|update)\s+([a-z_][a-z0-9_]*)/i);
+  if (tableMatch) {
+    result.table = tableMatch[1];
+  }
+
+  // SELECT 컬럼 추출
+  if (result.type === 'SELECT') {
+    const colMatch = sql.match(/select\s+(.+?)\s+from/i);
+    if (colMatch) {
+      result.columns = colMatch[1].trim();
+    }
+  }
+
+  // WHERE 절 파싱
+  const whereMatch = sql.match(/where\s+(.+?)(?:\s+order\s+by|\s+limit|\s+offset|$)/i);
+  if (whereMatch) {
+    const wherePart = whereMatch[1].trim();
+    const conditions = wherePart.split(/\s+and\s+/i);
+
+    for (const cond of conditions) {
+      const parts = cond.match(/([a-z_][a-z0-9_]*)\s*(=|!=|<>|>|<|>=|<=|like)\s*(.+)/i);
+      if (parts) {
+        const field = parts[1].trim();
+        const op = parts[2].trim().toUpperCase();
+        let value = parts[3].trim();
+
+        if (value === '?') {
+          value = params[result.paramIndex++];
+        } else if (value.match(/^['"].*['"]$/)) {
+          value = value.slice(1, -1);
+        } else if (!isNaN(value)) {
+          value = Number(value);
+        }
+
+        result.where.push({ field, op, value });
+      }
+    }
+  }
+
+  // ORDER BY
+  const orderMatch = sql.match(/order\s+by\s+([a-z_][a-z0-9_]*)(?:\s+(asc|desc))?/i);
+  if (orderMatch) {
+    result.orderBy = orderMatch[1];
+    result.orderDir = (orderMatch[2] || 'ASC').toUpperCase();
+  }
+
+  // LIMIT
+  const limitMatch = sql.match(/limit\s+(\?|\d+)/i);
+  if (limitMatch) {
+    result.limit = limitMatch[1] === '?' ? params[result.paramIndex++] : parseInt(limitMatch[1]);
+  }
+
+  // OFFSET
+  const offsetMatch = sql.match(/offset\s+(\?|\d+)/i);
+  if (offsetMatch) {
+    result.offset = offsetMatch[1] === '?' ? params[result.paramIndex++] : parseInt(offsetMatch[1]);
+  }
+
+  // INSERT VALUES
+  if (result.type === 'INSERT') {
+    const colsMatch = sql.match(/\(([^)]+)\)\s*values/i);
+    const valsMatch = sql.match(/values\s*\(([^)]+)\)/i);
+    if (colsMatch && valsMatch) {
+      const cols = colsMatch[1].split(',').map(c => c.trim());
+      const vals = valsMatch[1].split(',').map(v => v.trim());
+      for (let i = 0; i < cols.length; i++) {
+        let val = vals[i];
+        if (val === '?') {
+          val = params[result.paramIndex++];
+        } else if (val.match(/^['"].*['"]$/)) {
+          val = val.slice(1, -1);
+        } else if (!isNaN(val)) {
+          val = Number(val);
+        }
+        result.values[cols[i]] = val;
+      }
+    }
+  }
+
+  // UPDATE SET
+  if (result.type === 'UPDATE') {
+    const setMatch = sql.match(/set\s+(.+?)(?:\s+where|$)/i);
+    if (setMatch) {
+      const setParts = setMatch[1].split(',');
+      for (const part of setParts) {
+        const [col, val] = part.split('=').map(s => s.trim());
+        let value = val;
+        if (val === '?') {
+          value = params[result.paramIndex++];
+        } else if (val.match(/^['"].*['"]$/)) {
+          value = val.slice(1, -1);
+        } else if (!isNaN(val)) {
+          value = Number(val);
+        }
+        result.values[col] = value;
+      }
+    }
+  }
+
+  return result;
+}
+
+function matchesWhere(doc, where) {
+  for (const { field, op, value } of where) {
+    let docVal = doc[field];
+
+    // is_active 기본값
+    if (docVal === undefined && field === 'is_active') {
+      docVal = 1;
+    }
+
+    switch (op) {
+      case '=':
+        if (docVal != value) return false;
+        break;
+      case '!=':
+      case '<>':
+        if (docVal == value) return false;
+        break;
+      case '>':
+        if (!(docVal > value)) return false;
+        break;
+      case '<':
+        if (!(docVal < value)) return false;
+        break;
+      case '>=':
+        if (!(docVal >= value)) return false;
+        break;
+      case '<=':
+        if (!(docVal <= value)) return false;
+        break;
+      case 'LIKE':
+        const pattern = value.replace(/%/g, '.*').replace(/_/g, '.');
+        if (!new RegExp(`^${pattern}$`, 'i').test(docVal || '')) return false;
+        break;
+    }
+  }
+  return true;
+}
+
+function executeSelect(parsed, collection) {
+  const col = ensureCollection(collection);
+  const isCount = parsed.columns.toLowerCase().includes('count(*)');
+
+  // 전체 문서 조회 (_index 제외)
+  const rows = db.prepare(`SELECT id, data FROM ${col} WHERE _deleted = 0 AND id != '_index'`).all();
+  let docs = rows.map(r => {
+    let data = JSON.parse(r.data);
+    // aiosqlite_compat에서 {data: {...}} 형태로 저장된 경우 처리
+    if (data.data && typeof data.data === 'object') {
+      data = data.data;
+    }
+    return { ...data, id: parseInt(r.id) || r.id };
+  });
+
+  // WHERE 필터링
+  if (parsed.where.length > 0) {
+    docs = docs.filter(doc => matchesWhere(doc, parsed.where));
+  }
+
+  // COUNT(*)
+  if (isCount) {
+    return [{ 'COUNT(*)': docs.length }];
+  }
+
+  // ORDER BY
+  if (parsed.orderBy) {
+    docs.sort((a, b) => {
+      const aVal = a[parsed.orderBy];
+      const bVal = b[parsed.orderBy];
+      if (aVal < bVal) return parsed.orderDir === 'ASC' ? -1 : 1;
+      if (aVal > bVal) return parsed.orderDir === 'ASC' ? 1 : -1;
+      return 0;
+    });
+  }
+
+  // OFFSET
+  if (parsed.offset) {
+    docs = docs.slice(parsed.offset);
+  }
+
+  // LIMIT
+  if (parsed.limit) {
+    docs = docs.slice(0, parsed.limit);
+  }
+
+  // 특정 컬럼만 선택
+  if (parsed.columns !== '*' && !isCount) {
+    const cols = parsed.columns.split(',').map(c => c.trim());
+    docs = docs.map(doc => {
+      const result = {};
+      for (const col of cols) {
+        if (doc.hasOwnProperty(col)) {
+          result[col] = doc[col];
+        }
+      }
+      return result;
+    });
+  }
+
+  return docs;
+}
+
+function executeInsert(parsed, collection) {
+  const col = ensureCollection(collection);
+
+  // 새 ID 생성 (auto increment)
+  const indexRow = db.prepare(`SELECT data FROM ${col} WHERE id = '_index' AND _deleted = 0`).get();
+  let index = indexRow ? JSON.parse(indexRow.data) : { ids: [], next_id: 1 };
+
+  const newId = String(index.next_id);
+  index.next_id++;
+  index.ids.push(newId);
+
+  // 문서 데이터
+  const docData = { ...parsed.values, id: parseInt(newId) };
+
+  // 인덱스 업데이트
+  db.prepare(`INSERT OR REPLACE INTO ${col} (id, data, _version, _deleted, _updated_at) VALUES (?, ?, 1, 0, ?)`)
+    .run('_index', JSON.stringify(index), Date.now());
+
+  // 문서 저장
+  db.prepare(`INSERT OR REPLACE INTO ${col} (id, data, _version, _deleted, _updated_at) VALUES (?, ?, 1, 0, ?)`)
+    .run(newId, JSON.stringify(docData), Date.now());
+
+  return { id: parseInt(newId), ...docData };
+}
+
+function executeUpdate(parsed, collection) {
+  const col = ensureCollection(collection);
+
+  // 대상 문서 찾기
+  const rows = db.prepare(`SELECT id, data FROM ${col} WHERE _deleted = 0 AND id != '_index'`).all();
+  let updated = 0;
+
+  for (const row of rows) {
+    const doc = { id: row.id, ...JSON.parse(row.data) };
+    if (matchesWhere(doc, parsed.where)) {
+      // 업데이트 적용
+      const newDoc = { ...doc, ...parsed.values };
+      db.prepare(`UPDATE ${col} SET data = ?, _version = _version + 1, _updated_at = ? WHERE id = ?`)
+        .run(JSON.stringify(newDoc), Date.now(), row.id);
+      updated++;
+    }
+  }
+
+  return { updated };
+}
+
+function executeDelete(parsed, collection) {
+  const col = ensureCollection(collection);
+
+  // 대상 문서 찾기
+  const rows = db.prepare(`SELECT id, data FROM ${col} WHERE _deleted = 0 AND id != '_index'`).all();
+  let deleted = 0;
+
+  for (const row of rows) {
+    const doc = { id: row.id, ...JSON.parse(row.data) };
+    if (matchesWhere(doc, parsed.where)) {
+      // soft delete
+      db.prepare(`UPDATE ${col} SET _deleted = 1, _updated_at = ? WHERE id = ?`)
+        .run(Date.now(), row.id);
+
+      // 인덱스에서 제거
+      const indexRow = db.prepare(`SELECT data FROM ${col} WHERE id = '_index'`).get();
+      if (indexRow) {
+        const index = JSON.parse(indexRow.data);
+        index.ids = index.ids.filter(id => id !== row.id);
+        db.prepare(`UPDATE ${col} SET data = ?, _updated_at = ? WHERE id = '_index'`)
+          .run(JSON.stringify(index), Date.now());
+      }
+      deleted++;
+    }
+  }
+
+  return { deleted };
+}
+
+// SQL API 엔드포인트
+fastify.post("/api/sql", async (req, reply) => {
+  const { sql, params = [], collection } = req.body;
+
+  if (!sql) {
+    return reply.code(400).send({ error: "sql is required" });
+  }
+  if (!collection) {
+    return reply.code(400).send({ error: "collection is required" });
+  }
+
+  try {
+    const parsed = parseSql(sql, params);
+    let result;
+
+    switch (parsed.type) {
+      case 'SELECT':
+        result = executeSelect(parsed, collection);
+        return { success: true, rows: result, rowcount: result.length };
+      case 'INSERT':
+        result = executeInsert(parsed, collection);
+        return { success: true, row: result, lastrowid: result.id };
+      case 'UPDATE':
+        result = executeUpdate(parsed, collection);
+        return { success: true, ...result };
+      case 'DELETE':
+        result = executeDelete(parsed, collection);
+        return { success: true, ...result };
+      default:
+        return reply.code(400).send({ error: "Unsupported query type" });
+    }
+  } catch (e) {
+    return reply.code(500).send({ error: e.message });
+  }
+});
+
 // ===== Graceful Shutdown =====
 let isShuttingDown = false;
 
