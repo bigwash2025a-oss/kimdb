@@ -64,7 +64,7 @@ const config = {
   }
 };
 
-const VERSION = "6.0.0";
+const VERSION = "6.1.0";
 const DB_DIR = join(__dirname, "..", "shared_database");
 const DB_PATH = join(DB_DIR, "code_team_ai.db");
 const BACKUP_DIR = join(__dirname, "..", "backups");
@@ -1412,25 +1412,50 @@ function parseSql(sql, params = []) {
   const whereMatch = sql.match(/where\s+(.+?)(?:\s+order\s+by|\s+limit|\s+offset|$)/i);
   if (whereMatch) {
     const wherePart = whereMatch[1].trim();
-    const conditions = wherePart.split(/\s+and\s+/i);
 
-    for (const cond of conditions) {
-      const parts = cond.match(/([a-z_][a-z0-9_]*)\s*(=|!=|<>|>|<|>=|<=|like)\s*(.+)/i);
-      if (parts) {
-        const field = parts[1].trim();
-        const op = parts[2].trim().toUpperCase();
-        let value = parts[3].trim();
+    // OR 조건도 파싱 (OR로 분리 후 각각 AND 조건 처리)
+    const orGroups = wherePart.split(/\s+or\s+/i);
+    result.orGroups = [];
 
-        if (value === '?') {
-          value = params[result.paramIndex++];
-        } else if (value.match(/^['"].*['"]$/)) {
-          value = value.slice(1, -1);
-        } else if (!isNaN(value)) {
-          value = Number(value);
+    for (const orGroup of orGroups) {
+      const conditions = orGroup.split(/\s+and\s+/i);
+      const andConditions = [];
+
+      for (const cond of conditions) {
+        // GLOB 패턴: field GLOB 'pattern'
+        const globParts = cond.match(/([a-z_][a-z0-9_]*)\s+glob\s+['"]?([^'"]+)['"]?/i);
+        if (globParts) {
+          andConditions.push({ field: globParts[1].trim(), op: 'GLOB', value: globParts[2].trim() });
+          continue;
         }
 
-        result.where.push({ field, op, value });
+        // 범위/비교 연산자 (>=, <= 먼저 체크!)
+        const parts = cond.match(/([a-z_][a-z0-9_]*)\s*(>=|<=|!=|<>|>|<|=|like)\s*(.+)/i);
+        if (parts) {
+          const field = parts[1].trim();
+          const op = parts[2].trim().toUpperCase();
+          let value = parts[3].trim();
+
+          if (value === '?') {
+            value = params[result.paramIndex++];
+          } else if (value.match(/^['"].*['"]$/)) {
+            value = value.slice(1, -1);
+          } else if (!isNaN(value)) {
+            value = Number(value);
+          }
+
+          andConditions.push({ field, op, value });
+        }
       }
+
+      if (andConditions.length > 0) {
+        result.orGroups.push(andConditions);
+      }
+    }
+
+    // 단일 AND 조건만 있을 경우 기존 호환성 유지
+    if (result.orGroups.length === 1) {
+      result.where = result.orGroups[0];
     }
   }
 
@@ -1497,47 +1522,71 @@ function parseSql(sql, params = []) {
   return result;
 }
 
-function matchesWhere(doc, where) {
-  for (const { field, op, value } of where) {
-    let docVal = doc[field];
+function matchesCondition(doc, { field, op, value }) {
+  let docVal = doc[field];
 
-    // is_active 기본값
-    if (docVal === undefined && field === 'is_active') {
-      docVal = 1;
-    }
+  // is_active 기본값
+  if (docVal === undefined && field === 'is_active') {
+    docVal = 1;
+  }
 
-    switch (op) {
-      case '=':
-        if (docVal != value) return false;
-        break;
-      case '!=':
-      case '<>':
-        if (docVal == value) return false;
-        break;
-      case '>':
-        if (!(docVal > value)) return false;
-        break;
-      case '<':
-        if (!(docVal < value)) return false;
-        break;
-      case '>=':
-        if (!(docVal >= value)) return false;
-        break;
-      case '<=':
-        if (!(docVal <= value)) return false;
-        break;
-      case 'LIKE':
-        const pattern = value.replace(/%/g, '.*').replace(/_/g, '.');
-        if (!new RegExp(`^${pattern}$`, 'i').test(docVal || '')) return false;
-        break;
-    }
+  switch (op) {
+    case '=':
+      return docVal == value;
+    case '!=':
+    case '<>':
+      return docVal != value;
+    case '>':
+      return docVal > value;
+    case '<':
+      return docVal < value;
+    case '>=':
+      return docVal >= value;
+    case '<=':
+      return docVal <= value;
+    case 'LIKE':
+      const likePattern = value.replace(/%/g, '.*').replace(/_/g, '.');
+      return new RegExp(`^${likePattern}$`, 'i').test(docVal || '');
+    case 'GLOB':
+      // GLOB: * → .*, ? → ., [abc] → [abc]
+      const globPattern = value
+        .replace(/\*/g, '.*')
+        .replace(/\?/g, '.')
+        .replace(/\[!/g, '[^');
+      return new RegExp(`^${globPattern}$`).test(docVal || '');
+    default:
+      return true;
+  }
+}
+
+function matchesWhere(doc, where, orGroups = null) {
+  // OR 조건 그룹이 있으면 하나라도 만족하면 true
+  if (orGroups && orGroups.length > 1) {
+    return orGroups.some(andGroup =>
+      andGroup.every(cond => matchesCondition(doc, cond))
+    );
+  }
+
+  // AND 조건만 있는 경우
+  for (const cond of where) {
+    if (!matchesCondition(doc, cond)) return false;
   }
   return true;
 }
 
 function executeSelect(parsed, collection) {
   const col = ensureCollection(collection);
-  const isCount = parsed.columns.toLowerCase().includes('count(*)');
+  const colsLower = parsed.columns.toLowerCase();
+  const isCount = colsLower.includes('count(*)');
+
+  // COUNT(*) alias 추출 (SELECT COUNT(*) as cnt → alias = 'cnt')
+  let countAlias = 'COUNT(*)';
+  if (isCount) {
+    const aliasMatch = parsed.columns.match(/count\s*\(\s*\*\s*\)\s+(?:as\s+)?([a-z_][a-z0-9_]*)/i);
+    if (aliasMatch) {
+      countAlias = aliasMatch[1];
+    }
+  }
 
   // 전체 문서 조회 (_index 제외)
   const rows = db.prepare(`SELECT id, data FROM ${col} WHERE _deleted = 0 AND id != '_index'`).all();
@@ -1550,14 +1599,20 @@ function executeSelect(parsed, collection) {
     return { ...data, id: parseInt(r.id) || r.id };
   });
 
-  // WHERE 필터링
-  if (parsed.where.length > 0) {
-    docs = docs.filter(doc => matchesWhere(doc, parsed.where));
+  // WHERE 필터링 (OR 조건 지원)
+  if (parsed.where.length > 0 || (parsed.orGroups && parsed.orGroups.length > 0)) {
+    docs = docs.filter(doc => matchesWhere(doc, parsed.where, parsed.orGroups));
   }
 
   // COUNT(*)
   if (isCount) {
-    return [{ 'COUNT(*)': docs.length }];
+    const result = {};
+    result[countAlias] = docs.length;
+    // 호환성을 위해 둘 다 제공
+    if (countAlias !== 'COUNT(*)') {
+      result['COUNT(*)'] = docs.length;
+    }
+    return [result];
   }
 
   // ORDER BY
@@ -1613,12 +1668,12 @@ function executeInsert(parsed, collection) {
   const docData = { ...parsed.values, id: parseInt(newId) };
 
   // 인덱스 업데이트
-  db.prepare(`INSERT OR REPLACE INTO ${col} (id, data, _version, _deleted, _updated_at) VALUES (?, ?, 1, 0, ?)`)
-    .run('_index', JSON.stringify(index), Date.now());
+  db.prepare(`INSERT OR REPLACE INTO ${col} (id, data, _version, _deleted, updated_at) VALUES (?, ?, 1, 0, CURRENT_TIMESTAMP)`)
+    .run('_index', JSON.stringify(index));
 
   // 문서 저장
-  db.prepare(`INSERT OR REPLACE INTO ${col} (id, data, _version, _deleted, _updated_at) VALUES (?, ?, 1, 0, ?)`)
-    .run(newId, JSON.stringify(docData), Date.now());
+  db.prepare(`INSERT OR REPLACE INTO ${col} (id, data, _version, _deleted, updated_at) VALUES (?, ?, 1, 0, CURRENT_TIMESTAMP)`)
+    .run(newId, JSON.stringify(docData));
 
   return { id: parseInt(newId), ...docData };
 }
@@ -1632,11 +1687,11 @@ function executeUpdate(parsed, collection) {
 
   for (const row of rows) {
     const doc = { id: row.id, ...JSON.parse(row.data) };
-    if (matchesWhere(doc, parsed.where)) {
+    if (matchesWhere(doc, parsed.where, parsed.orGroups)) {
       // 업데이트 적용
       const newDoc = { ...doc, ...parsed.values };
-      db.prepare(`UPDATE ${col} SET data = ?, _version = _version + 1, _updated_at = ? WHERE id = ?`)
-        .run(JSON.stringify(newDoc), Date.now(), row.id);
+      db.prepare(`UPDATE ${col} SET data = ?, _version = _version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+        .run(JSON.stringify(newDoc), row.id);
       updated++;
     }
   }
@@ -1653,18 +1708,18 @@ function executeDelete(parsed, collection) {
 
   for (const row of rows) {
     const doc = { id: row.id, ...JSON.parse(row.data) };
-    if (matchesWhere(doc, parsed.where)) {
+    if (matchesWhere(doc, parsed.where, parsed.orGroups)) {
       // soft delete
-      db.prepare(`UPDATE ${col} SET _deleted = 1, _updated_at = ? WHERE id = ?`)
-        .run(Date.now(), row.id);
+      db.prepare(`UPDATE ${col} SET _deleted = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+        .run(row.id);
 
       // 인덱스에서 제거
       const indexRow = db.prepare(`SELECT data FROM ${col} WHERE id = '_index'`).get();
       if (indexRow) {
         const index = JSON.parse(indexRow.data);
         index.ids = index.ids.filter(id => id !== row.id);
-        db.prepare(`UPDATE ${col} SET data = ?, _updated_at = ? WHERE id = '_index'`)
-          .run(JSON.stringify(index), Date.now());
+        db.prepare(`UPDATE ${col} SET data = ?, updated_at = CURRENT_TIMESTAMP WHERE id = '_index'`)
+          .run(JSON.stringify(index));
       }
       deleted++;
     }
