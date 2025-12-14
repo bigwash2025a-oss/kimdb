@@ -22,7 +22,8 @@ import Database from "better-sqlite3";
 import crypto from "crypto";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import { mkdirSync, existsSync, readdirSync, statSync, unlinkSync } from "fs";
+import { mkdirSync, existsSync, readdirSync, statSync, unlinkSync, copyFileSync, writeFileSync, readFileSync } from "fs";
+import { createHash } from "crypto";
 import {
   VectorClock,
   CRDTDocument,
@@ -64,23 +65,266 @@ const config = {
   }
 };
 
-const VERSION = "6.1.0";
+const VERSION = "7.6.0";
 const DB_DIR = join(__dirname, "..", "shared_database");
 const DB_PATH = join(DB_DIR, "code_team_ai.db");
 const BACKUP_DIR = join(__dirname, "..", "backups");
+const WAL_LOG_DIR = join(__dirname, "..", "wal-logs");
 
 if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true });
 if (!existsSync(BACKUP_DIR)) mkdirSync(BACKUP_DIR, { recursive: true });
+if (!existsSync(WAL_LOG_DIR)) mkdirSync(WAL_LOG_DIR, { recursive: true });
 
-// ===== Database Setup =====
+// ===== Safety Configuration =====
+const safetyConfig = {
+  // 백업 설정
+  backupIntervalMs: parseInt(process.env.BACKUP_INTERVAL) || 60 * 60 * 1000,  // 1시간
+  maxBackups: parseInt(process.env.MAX_BACKUPS) || 24,  // 최대 24개 보관
+
+  // 체크포인트 설정
+  checkpointIntervalMs: parseInt(process.env.CHECKPOINT_INTERVAL) || 5 * 60 * 1000,  // 5분
+  checkpointThreshold: parseInt(process.env.CHECKPOINT_THRESHOLD) || 1000,  // 1000 쓰기
+
+  // 무결성 검사
+  integrityCheckIntervalMs: parseInt(process.env.INTEGRITY_CHECK_INTERVAL) || 6 * 60 * 60 * 1000,  // 6시간
+
+  // 안전 레벨 (1: 성능, 2: 균형, 3: 안전)
+  safetyLevel: parseInt(process.env.SAFETY_LEVEL) || 2
+};
+
+// ===== Database Setup with Safety =====
+// 크래시 복구 체크
+const lockFile = DB_PATH + '.lock';
+if (existsSync(lockFile)) {
+  console.log('[kimdb] Previous crash detected, running recovery...');
+  try {
+    const tempDb = new Database(DB_PATH);
+    tempDb.pragma('wal_checkpoint(TRUNCATE)');
+    tempDb.close();
+    console.log('[kimdb] WAL recovery completed');
+  } catch (e) {
+    console.error('[kimdb] WAL recovery failed:', e.message);
+    // 백업에서 복구 시도
+    restoreFromLatestBackup();
+  }
+  try { unlinkSync(lockFile); } catch (e) {}
+}
+
+// 락 파일 생성
+writeFileSync(lockFile, JSON.stringify({
+  pid: process.pid,
+  startTime: new Date().toISOString()
+}));
+
 const db = new Database(DB_PATH);
+
+// 안전 레벨에 따른 pragma 설정
 db.pragma("journal_mode = WAL");
-db.pragma("synchronous = NORMAL");
+db.pragma("busy_timeout = 30000");
 db.pragma("cache_size = 10000");
 db.pragma("temp_store = MEMORY");
-db.pragma("mmap_size = 268435456");
-db.pragma("busy_timeout = 30000");
-db.pragma("wal_autocheckpoint = 1000");
+
+switch (safetyConfig.safetyLevel) {
+  case 1:  // 성능 우선
+    db.pragma("synchronous = NORMAL");
+    db.pragma("wal_autocheckpoint = 10000");
+    break;
+  case 2:  // 균형 (기본)
+    db.pragma("synchronous = NORMAL");
+    db.pragma("wal_autocheckpoint = 1000");
+    db.pragma("mmap_size = 268435456");  // 256MB
+    break;
+  case 3:  // 안전 최우선
+    db.pragma("synchronous = FULL");
+    db.pragma("wal_autocheckpoint = 100");
+    break;
+}
+
+console.log(`[kimdb] Safety level: ${safetyConfig.safetyLevel}`);
+
+// ===== Safety Functions =====
+let safetyStats = {
+  backups: 0,
+  checkpoints: 0,
+  integrityChecks: 0,
+  recoveries: 0,
+  writesSinceCheckpoint: 0,
+  lastBackup: null,
+  lastCheckpoint: null,
+  lastIntegrityCheck: null,
+  errors: []
+};
+
+// 파일 체크섬 생성
+function fileChecksum(filePath) {
+  const content = readFileSync(filePath);
+  return createHash('sha256').update(content).digest('hex');
+}
+
+// 백업 목록 조회
+function getBackupList() {
+  if (!existsSync(BACKUP_DIR)) return [];
+
+  return readdirSync(BACKUP_DIR)
+    .filter(f => f.startsWith('backup_') && f.endsWith('.db'))
+    .map(name => ({
+      name,
+      path: join(BACKUP_DIR, name),
+      time: statSync(join(BACKUP_DIR, name)).mtime
+    }))
+    .sort((a, b) => b.time - a.time);
+}
+
+// 자동 백업
+function createBackup() {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupName = `backup_${timestamp}.db`;
+  const backupPath = join(BACKUP_DIR, backupName);
+
+  try {
+    // 체크포인트 후 백업
+    db.pragma('wal_checkpoint(TRUNCATE)');
+
+    // 파일 복사
+    copyFileSync(DB_PATH, backupPath);
+
+    // 체크섬 저장
+    const checksum = fileChecksum(backupPath);
+    writeFileSync(backupPath + '.sha256', checksum);
+
+    safetyStats.backups++;
+    safetyStats.lastBackup = new Date().toISOString();
+
+    console.log(`[kimdb] Backup created: ${backupName}`);
+
+    // 오래된 백업 정리
+    cleanupOldBackups();
+
+    return { path: backupPath, checksum };
+  } catch (e) {
+    console.error('[kimdb] Backup failed:', e.message);
+    logSafetyError('backup', e);
+    return null;
+  }
+}
+
+// 오래된 백업 정리
+function cleanupOldBackups() {
+  const backups = getBackupList();
+
+  while (backups.length > safetyConfig.maxBackups) {
+    const oldest = backups.pop();
+    try {
+      unlinkSync(oldest.path);
+      if (existsSync(oldest.path + '.sha256')) {
+        unlinkSync(oldest.path + '.sha256');
+      }
+      console.log(`[kimdb] Deleted old backup: ${oldest.name}`);
+    } catch (e) {}
+  }
+}
+
+// 최신 백업에서 복구
+function restoreFromLatestBackup() {
+  const backups = getBackupList();
+
+  if (backups.length === 0) {
+    console.error('[kimdb] No backups available for recovery!');
+    return false;
+  }
+
+  const latest = backups[0];
+  console.log(`[kimdb] Restoring from backup: ${latest.name}`);
+
+  try {
+    // 체크섬 검증
+    const checksumFile = latest.path + '.sha256';
+    if (existsSync(checksumFile)) {
+      const savedChecksum = readFileSync(checksumFile, 'utf8').trim();
+      const actualChecksum = fileChecksum(latest.path);
+      if (savedChecksum !== actualChecksum) {
+        console.error('[kimdb] Backup checksum mismatch!');
+        return false;
+      }
+    }
+
+    // 현재 DB 백업 (손상 파일 보관)
+    if (existsSync(DB_PATH)) {
+      const corruptPath = DB_PATH + '.corrupt.' + Date.now();
+      copyFileSync(DB_PATH, corruptPath);
+    }
+
+    // 복구
+    copyFileSync(latest.path, DB_PATH);
+    safetyStats.recoveries++;
+    console.log('[kimdb] Restore completed');
+    return true;
+  } catch (e) {
+    console.error('[kimdb] Restore failed:', e.message);
+    return false;
+  }
+}
+
+// 무결성 검사
+function checkIntegrity() {
+  try {
+    const result = db.pragma('integrity_check');
+    safetyStats.integrityChecks++;
+    safetyStats.lastIntegrityCheck = new Date().toISOString();
+
+    const isOk = result[0].integrity_check === 'ok';
+
+    if (!isOk) {
+      console.error('[kimdb] INTEGRITY CHECK FAILED!', result);
+      // VACUUM으로 복구 시도
+      try {
+        db.exec('VACUUM');
+        const recheck = db.pragma('integrity_check');
+        if (recheck[0].integrity_check === 'ok') {
+          console.log('[kimdb] Integrity restored via VACUUM');
+          return true;
+        }
+      } catch (e) {}
+    } else {
+      console.log('[kimdb] Integrity check passed');
+    }
+
+    return isOk;
+  } catch (e) {
+    console.error('[kimdb] Integrity check error:', e.message);
+    logSafetyError('integrity_check', e);
+    return false;
+  }
+}
+
+// 강제 체크포인트
+function forceCheckpoint(mode = 'PASSIVE') {
+  try {
+    const result = db.pragma(`wal_checkpoint(${mode})`);
+    safetyStats.checkpoints++;
+    safetyStats.lastCheckpoint = new Date().toISOString();
+    safetyStats.writesSinceCheckpoint = 0;
+    return result[0];
+  } catch (e) {
+    console.error('[kimdb] Checkpoint failed:', e.message);
+    logSafetyError('checkpoint', e);
+    return null;
+  }
+}
+
+// 안전 에러 로깅
+function logSafetyError(operation, error) {
+  safetyStats.errors.push({
+    time: new Date().toISOString(),
+    operation,
+    message: error.message
+  });
+
+  // 최근 50개만 유지
+  if (safetyStats.errors.length > 50) {
+    safetyStats.errors.shift();
+  }
+}
 
 // ===== MariaDB Logger =====
 let mariaPool = null;
@@ -1853,11 +2097,15 @@ async function gracefulShutdown(signal) {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
-  console.log(`[kimdb] ${signal} received, starting graceful shutdown...`);
+  console.log(`[kimdb] ${signal} received, starting safe shutdown...`);
 
-  // 1. 새 연결 거부 (이미 isShuttingDown으로 처리)
+  // 0. 안전 타이머 정리
+  console.log("[kimdb] Stopping safety timers...");
+  if (safetyTimers.backup) clearInterval(safetyTimers.backup);
+  if (safetyTimers.checkpoint) clearInterval(safetyTimers.checkpoint);
+  if (safetyTimers.integrity) clearInterval(safetyTimers.integrity);
 
-  // 2. 모든 캐시된 문서 저장
+  // 1. 모든 캐시된 문서 저장
   console.log("[kimdb] Saving cached documents...");
   for (const key of crdtDocs.keys()) {
     const doc = crdtDocs.get(key);
@@ -1867,7 +2115,7 @@ async function gracefulShutdown(signal) {
     }
   }
 
-  // 3. 클라이언트 연결 종료 알림
+  // 2. 클라이언트 연결 종료 알림
   console.log(`[kimdb] Closing ${clients.size} connections...`);
   for (const [, client] of clients) {
     try {
@@ -1884,32 +2132,66 @@ async function gracefulShutdown(signal) {
     await redisSub.quit().catch(() => {});
   }
 
-  // 5. DB 체크포인트
+  // 5. 최종 DB 체크포인트
+  console.log("[kimdb] Final checkpoint...");
   try {
     db.pragma("wal_checkpoint(TRUNCATE)");
+    console.log("[kimdb] Checkpoint completed");
+  } catch (e) {
+    console.error("[kimdb] Checkpoint failed:", e.message);
+  }
+
+  // 6. DB 닫기
+  try {
+    db.close();
+    console.log("[kimdb] Database closed");
   } catch (e) {}
 
-  // 6. 서버 종료
+  // 7. 락 파일 삭제
+  try {
+    unlinkSync(lockFile);
+  } catch (e) {}
+
+  // 8. 서버 종료
   await fastify.close();
 
-  console.log("[kimdb] Shutdown complete");
+  console.log("[kimdb] Safe shutdown complete");
+  console.log(`[kimdb] Stats - Backups: ${safetyStats.backups}, Checkpoints: ${safetyStats.checkpoints}, Recoveries: ${safetyStats.recoveries}`);
   process.exit(0);
 }
 
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("beforeExit", () => gracefulShutdown("beforeExit"));
+
+// ===== Safety Timers =====
+const safetyTimers = {
+  backup: null,
+  checkpoint: null,
+  integrity: null
+};
+
+// 자동 백업 타이머
+safetyTimers.backup = setInterval(() => {
+  if (!isShuttingDown) createBackup();
+}, safetyConfig.backupIntervalMs);
+
+// 체크포인트 타이머
+safetyTimers.checkpoint = setInterval(() => {
+  if (!isShuttingDown) {
+    forceCheckpoint('PASSIVE');
+    metrics.checkpoints.total++;
+    metrics.checkpoints.lastAt = new Date().toISOString();
+  }
+}, safetyConfig.checkpointIntervalMs);
+
+// 무결성 검사 타이머
+safetyTimers.integrity = setInterval(() => {
+  if (!isShuttingDown) checkIntegrity();
+}, safetyConfig.integrityCheckIntervalMs);
 
 // ===== Cleanup Timer =====
 const cleanupTimer = setInterval(runCleanup, config.cache.cleanupInterval);
-
-// WAL Checkpoint
-const checkpointTimer = setInterval(() => {
-  try {
-    db.pragma("wal_checkpoint(PASSIVE)");
-    metrics.checkpoints.total++;
-    metrics.checkpoints.lastAt = new Date().toISOString();
-  } catch (e) {}
-}, 10 * 60 * 1000);
 
 // ===== Monitor Dashboard =====
 fastify.get("/kimdb/dashboard", async (req, reply) => {
@@ -1917,8 +2199,6 @@ fastify.get("/kimdb/dashboard", async (req, reply) => {
 });
 
 fastify.get("/kimdb/status", async () => {
-  const shardStats = [];
-
   // 기본 통계
   const collections = stmt.getCollections.all();
   let totalRows = 0;
@@ -1951,7 +2231,57 @@ fastify.get("/kimdb/status", async () => {
       writesPerSecond: 0,
       peakBufferSize: 0
     },
-    connections: clients.size
+    connections: clients.size,
+    // 안전 관련 통계
+    safety: {
+      level: safetyConfig.safetyLevel,
+      backups: safetyStats.backups,
+      checkpoints: safetyStats.checkpoints,
+      integrityChecks: safetyStats.integrityChecks,
+      recoveries: safetyStats.recoveries,
+      lastBackup: safetyStats.lastBackup,
+      lastCheckpoint: safetyStats.lastCheckpoint,
+      lastIntegrityCheck: safetyStats.lastIntegrityCheck,
+      backupCount: getBackupList().length,
+      errors: safetyStats.errors.length
+    }
+  };
+});
+
+// ===== Safety API Endpoints =====
+
+// 수동 백업
+fastify.post("/kimdb/backup", async (req, reply) => {
+  const result = createBackup();
+  if (result) {
+    return { success: true, ...result };
+  }
+  return reply.code(500).send({ error: "Backup failed" });
+});
+
+// 백업 목록
+fastify.get("/kimdb/backups", async () => {
+  return { backups: getBackupList() };
+});
+
+// 무결성 검사
+fastify.post("/kimdb/integrity-check", async () => {
+  const isOk = checkIntegrity();
+  return { success: true, integrity: isOk ? 'ok' : 'failed' };
+});
+
+// 강제 체크포인트
+fastify.post("/kimdb/checkpoint", async () => {
+  const result = forceCheckpoint('TRUNCATE');
+  return { success: true, result };
+});
+
+// 안전 통계
+fastify.get("/kimdb/safety", async () => {
+  return {
+    config: safetyConfig,
+    stats: safetyStats,
+    backups: getBackupList()
   };
 });
 
