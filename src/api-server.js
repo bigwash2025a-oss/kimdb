@@ -79,7 +79,7 @@ db.pragma("synchronous = NORMAL");
 db.pragma("cache_size = 10000");
 db.pragma("temp_store = MEMORY");
 db.pragma("mmap_size = 268435456");
-db.pragma("busy_timeout = 5000");
+db.pragma("busy_timeout = 30000");
 db.pragma("wal_autocheckpoint = 1000");
 
 // ===== MariaDB Logger =====
