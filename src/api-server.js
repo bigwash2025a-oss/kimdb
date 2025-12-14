@@ -1365,6 +1365,85 @@ fastify.get("/api/c/:collection/:id", async (req, reply) => {
   return { success: true, id: row.id, data: JSON.parse(row.data), _version: row._version };
 });
 
+// PUT - 데이터 저장 (upsert)
+fastify.put("/api/c/:collection/:id", async (req, reply) => {
+  const col = ensureCollection(req.params.collection);
+  const id = req.params.id;
+  const { data } = req.body || {};
+
+  if (!data) {
+    return reply.code(400).send({ error: "data is required" });
+  }
+
+  const existing = db.prepare(`SELECT * FROM ${col} WHERE id = ? AND _deleted = 0`).get(id);
+
+  if (existing) {
+    // UPDATE
+    const merged = { ...JSON.parse(existing.data), ...data };
+    db.prepare(`UPDATE ${col} SET data = ?, _version = _version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+      .run(JSON.stringify(merged), id);
+    return { success: true, id, _version: existing._version + 1 };
+  } else {
+    // INSERT
+    db.prepare(`INSERT INTO ${col} (id, data, _version, _deleted, updated_at) VALUES (?, ?, 1, 0, CURRENT_TIMESTAMP)`)
+      .run(id, JSON.stringify(data));
+    return { success: true, id, _version: 1 };
+  }
+});
+
+// POST - 새 문서 생성 (ID 자동 생성)
+fastify.post("/api/c/:collection", async (req, reply) => {
+  const col = ensureCollection(req.params.collection);
+  const { data } = req.body || {};
+
+  if (!data) {
+    return reply.code(400).send({ error: "data is required" });
+  }
+
+  const id = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+  db.prepare(`INSERT INTO ${col} (id, data, _version, _deleted, updated_at) VALUES (?, ?, 1, 0, CURRENT_TIMESTAMP)`)
+    .run(id, JSON.stringify(data));
+
+  return { success: true, id, _version: 1 };
+});
+
+// PATCH - 부분 업데이트
+fastify.patch("/api/c/:collection/:id", async (req, reply) => {
+  const col = ensureCollection(req.params.collection);
+  const id = req.params.id;
+  const { data } = req.body || {};
+
+  if (!data) {
+    return reply.code(400).send({ error: "data is required" });
+  }
+
+  const existing = db.prepare(`SELECT * FROM ${col} WHERE id = ? AND _deleted = 0`).get(id);
+  if (!existing) {
+    return reply.code(404).send({ error: "Not found" });
+  }
+
+  const merged = { ...JSON.parse(existing.data), ...data };
+  db.prepare(`UPDATE ${col} SET data = ?, _version = _version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+    .run(JSON.stringify(merged), id);
+
+  return { success: true, id, _version: existing._version + 1 };
+});
+
+// DELETE - 소프트 삭제
+fastify.delete("/api/c/:collection/:id", async (req, reply) => {
+  const col = ensureCollection(req.params.collection);
+  const id = req.params.id;
+
+  const existing = db.prepare(`SELECT * FROM ${col} WHERE id = ? AND _deleted = 0`).get(id);
+  if (!existing) {
+    return reply.code(404).send({ error: "Not found" });
+  }
+
+  db.prepare(`UPDATE ${col} SET _deleted = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(id);
+
+  return { success: true, deleted: true };
+});
+
 // ===== SQL Engine =====
 /**
  * SQL 엔진 - kimdb에서 SQL 쿼리 직접 실행

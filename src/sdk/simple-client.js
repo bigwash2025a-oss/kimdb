@@ -2,7 +2,7 @@
  * kimdb Simple REST Client v1.0.0
  *
  * 간단한 get/set API
- * WebSocket 없이 REST만 사용
+ * kimdb 서버의 REST + SQL API 사용
  *
  * 사용법:
  *   const db = new KimDB('https://db.dclub.kr');
@@ -56,17 +56,24 @@ class KimDB {
     }
   }
 
+  // SQL 쿼리 실행
+  async _sql(collection, sql, params = []) {
+    return this._request('POST', '/api/sql', { collection, sql, params });
+  }
+
   // ===== 핵심 API =====
 
   /**
-   * 데이터 저장
+   * 데이터 저장 (INSERT or UPDATE)
    * @param {string} collection - 컬렉션 이름 (테이블)
    * @param {string} id - 문서 ID
    * @param {object} data - 저장할 데이터
    * @returns {Promise<{id, _version}>}
    */
   async set(collection, id, data) {
-    return this._request('PUT', `/api/c/${collection}/${id}`, { data });
+    // PUT API - upsert (insert or update)
+    const result = await this._request('PUT', `/api/c/${collection}/${id}`, { data });
+    return { id: result.id, _version: result._version };
   }
 
   /**
@@ -77,7 +84,11 @@ class KimDB {
    */
   async get(collection, id) {
     try {
-      return await this._request('GET', `/api/c/${collection}/${id}`);
+      const result = await this._request('GET', `/api/c/${collection}/${id}`);
+      if (result.success && result.id) {
+        return { id: result.id, data: result.data, _version: result._version };
+      }
+      return null;
     } catch (e) {
       if (e.message.includes('404')) return null;
       throw e;
@@ -88,10 +99,17 @@ class KimDB {
    * 데이터 삭제
    * @param {string} collection - 컬렉션 이름
    * @param {string} id - 문서 ID
-   * @returns {Promise<{deleted: true}>}
+   * @returns {Promise<{deleted: number}>}
    */
   async delete(collection, id) {
-    return this._request('DELETE', `/api/c/${collection}/${id}`);
+    // DELETE API - 소프트 삭제
+    try {
+      await this._request('DELETE', `/api/c/${collection}/${id}`);
+      return { deleted: 1 };
+    } catch (e) {
+      if (e.message.includes('404')) return { deleted: 0 };
+      throw e;
+    }
   }
 
   /**
@@ -101,14 +119,25 @@ class KimDB {
    * @returns {Promise<Array>}
    */
   async list(collection, options = {}) {
-    const params = new URLSearchParams();
-    if (options.limit) params.set('limit', options.limit);
-    if (options.offset) params.set('offset', options.offset);
-    if (options.orderBy) params.set('orderBy', options.orderBy);
-    if (options.order) params.set('order', options.order);
+    const result = await this._request('GET', `/api/c/${collection}`);
+    let data = result.data || [];
 
-    const query = params.toString() ? `?${params.toString()}` : '';
-    return this._request('GET', `/api/c/${collection}${query}`);
+    // 클라이언트 측 정렬/페이지네이션
+    if (options.orderBy) {
+      const dir = (options.order || 'ASC').toUpperCase() === 'DESC' ? -1 : 1;
+      data.sort((a, b) => {
+        const aVal = a.data?.[options.orderBy] || a[options.orderBy];
+        const bVal = b.data?.[options.orderBy] || b[options.orderBy];
+        if (aVal < bVal) return -dir;
+        if (aVal > bVal) return dir;
+        return 0;
+      });
+    }
+
+    if (options.offset) data = data.slice(options.offset);
+    if (options.limit) data = data.slice(0, options.limit);
+
+    return data;
   }
 
   /**
@@ -118,7 +147,9 @@ class KimDB {
    * @returns {Promise<{id, _version}>}
    */
   async create(collection, data) {
-    return this._request('POST', `/api/c/${collection}`, { data });
+    // POST API - ID 자동 생성
+    const result = await this._request('POST', `/api/c/${collection}`, { data });
+    return { id: result.id, _version: result._version };
   }
 
   /**
@@ -129,29 +160,34 @@ class KimDB {
    * @returns {Promise<{id, _version}>}
    */
   async update(collection, id, data) {
-    return this._request('PATCH', `/api/c/${collection}/${id}`, { data });
+    // PATCH API - 부분 업데이트
+    const result = await this._request('PATCH', `/api/c/${collection}/${id}`, { data });
+    return { id: result.id, _version: result._version };
   }
 
   // ===== SQL API =====
 
   /**
-   * SQL 쿼리 실행
+   * SQL 쿼리 실행 (SELECT)
+   * @param {string} collection - 컬렉션 이름
    * @param {string} sql - SQL 쿼리
    * @param {Array} params - 바인딩 파라미터
    * @returns {Promise<Array>}
    */
-  async query(sql, params = []) {
-    return this._request('POST', '/api/sql', { sql, params });
+  async query(collection, sql, params = []) {
+    const result = await this._sql(collection, sql, params);
+    return result.rows || [];
   }
 
   /**
    * SQL 실행 (INSERT/UPDATE/DELETE)
+   * @param {string} collection - 컬렉션 이름
    * @param {string} sql - SQL 쿼리
    * @param {Array} params - 바인딩 파라미터
-   * @returns {Promise<{changes, lastInsertRowid}>}
+   * @returns {Promise<{success, row?, updated?, deleted?}>}
    */
-  async execute(sql, params = []) {
-    return this._request('POST', '/api/sql/exec', { sql, params });
+  async execute(collection, sql, params = []) {
+    return this._sql(collection, sql, params);
   }
 
   // ===== 유틸리티 =====
@@ -161,12 +197,13 @@ class KimDB {
    * @returns {Promise<{status, version}>}
    */
   async health() {
-    return this._request('GET', '/api/health');
+    return this._request('GET', '/health');
   }
 
   /**
    * 컬렉션 존재 여부
    * @param {string} collection - 컬렉션 이름
+   * @param {string} id - 문서 ID
    * @returns {Promise<boolean>}
    */
   async exists(collection, id) {
@@ -200,19 +237,17 @@ class KimDB {
   /**
    * 검색 (WHERE 조건)
    * @param {string} collection - 컬렉션 이름
-   * @param {string} field - 필드명 (JSON 경로 지원: data.name)
+   * @param {string} field - 필드명 (예: name, email)
    * @param {string} op - 연산자 (=, !=, >, <, >=, <=, LIKE)
    * @param {any} value - 비교 값
    * @returns {Promise<Array>}
    */
   async find(collection, field, op, value) {
-    // JSON 필드 경로 처리
-    const jsonPath = field.startsWith('data.')
-      ? `json_extract(data, '$.${field.slice(5)}')`
-      : field;
-
-    const sql = `SELECT * FROM ${collection} WHERE ${jsonPath} ${op} ?`;
-    return this.query(sql, [value]);
+    const result = await this._sql(collection,
+      `SELECT * FROM ${collection} WHERE ${field} ${op} ?`,
+      [value]
+    );
+    return result.rows || [];
   }
 
   /**
@@ -221,8 +256,19 @@ class KimDB {
    * @returns {Promise<number>}
    */
   async count(collection) {
-    const result = await this.query(`SELECT COUNT(*) as cnt FROM ${collection}`);
-    return result[0]?.cnt || 0;
+    const result = await this._sql(collection,
+      `SELECT COUNT(*) as cnt FROM ${collection}`
+    );
+    return result.rows?.[0]?.cnt || 0;
+  }
+
+  /**
+   * 컬렉션 목록
+   * @returns {Promise<Array<string>>}
+   */
+  async collections() {
+    const result = await this._request('GET', '/api/collections');
+    return result.collections || [];
   }
 }
 
@@ -242,6 +288,8 @@ class Collection {
   find(field, op, value) { return this.db.find(this.name, field, op, value); }
   count() { return this.db.count(this.name); }
   exists(id) { return this.db.exists(this.name, id); }
+  query(sql, params) { return this.db.query(this.name, sql, params); }
+  execute(sql, params) { return this.db.execute(this.name, sql, params); }
 }
 
 // 컬렉션 프록시 추가
