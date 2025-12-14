@@ -1,7 +1,7 @@
 {
   "name": "kimdb",
   "version": "7.5.0",
-  "description": "High-performance document database with CRDT real-time sync + Transaction Manager",
+  "description": "High-performance document database with CRDT real-time sync + HyperScale + Transaction Manager",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -25,15 +25,29 @@
       "import": "./dist/crdt/index.js",
       "types": "./dist/crdt/index.d.ts"
     },
+    "./simple": {
+      "import": "./src/sdk/simple-client.js"
+    },
+    "./hyperscale": {
+      "import": "./src/hyper-scale-safe.js"
+    },
     "./sharding": {
       "import": "./src/sharding.js"
     },
     "./concurrent": {
       "import": "./src/concurrent-write.js"
+    },
+    "./monitor": {
+      "import": "./src/monitor.js"
     }
   },
   "files": [
     "dist",
+    "src/sdk",
+    "src/hyper-scale.js",
+    "src/hyper-scale-safe.js",
+    "src/sharding.js",
+    "src/monitor.js",
     "src/concurrent-write.js",
     "README.md",
     "LICENSE"
@@ -59,7 +73,9 @@
     "websocket",
     "offline-first",
     "transaction",
-    "concurrent-write"
+    "concurrent-write",
+    "hyperscale",
+    "sharding"
   ],
   "author": "Kim",
   "license": "MIT",
