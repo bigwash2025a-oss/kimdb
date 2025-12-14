@@ -35,11 +35,11 @@
     "dev": "tsx watch src/server/index.ts",
     "build": "tsc && node scripts/post-build.js",
     "start": "node dist/server/index.js",
-    "test": "vitest",
+    "test": "vitest run",
     "test:coverage": "vitest --coverage",
     "lint": "eslint src --ext .ts",
     "docs": "typedoc --out docs src/index.ts",
-    "prepublishOnly": "npm run build && npm run test"
+    "prepublish:manual": "npm run build && npm run test"
   },
   "keywords": [
     "database",
