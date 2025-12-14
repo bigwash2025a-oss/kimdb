@@ -1,36 +1,24 @@
 module.exports = {
-  apps: [
-    {
-      name: 'kimdb-73',
-      script: 'src/api-server.js',
-      cwd: '/home/kim/바탕화면/kim/kimdb',
-      env: {
-        PORT: 40000,
-        REDIS_HOST: '127.0.0.1',
-        SERVER_ID: 'srv-73',
-        MARIADB_HOST: '192.168.45.73'
-      }
+  apps: [{
+    name: 'kimdb',
+    script: 'src/api-server.js',
+    cwd: '/home/kimjin/Desktop/kim/kimdb',
+    env: {
+      PORT: 40000,
+      NODE_ENV: 'production'
     },
-    {
-      name: 'kimdb-monitor',
-      script: 'scripts/cross-check.js',
-      cwd: '/home/kim/바탕화면/kim/kimdb'
-    },
-    {
-      name: 'kimdb-dashboard',
-      script: 'scripts/monitor-server.js',
-      cwd: '/home/kim/바탕화면/kim/kimdb'
-    },
-    {
-      name: 'kimdb-integrity-test',
-      script: 'test/integrity-test.js',
-      cwd: '/home/kim/바탕화면/kim/kimdb',
-      env: {
-        TEST_HOURS: 24,
-        DOC_COUNT: 1000
-      },
-      autorestart: false,
-      watch: false
-    }
-  ]
+    // 로그 설정
+    log_date_format: 'YYYY-MM-DD HH:mm:ss',
+    error_file: '/home/kimjin/Desktop/kim/kimdb/logs/error.log',
+    out_file: '/home/kimjin/Desktop/kim/kimdb/logs/out.log',
+    merge_logs: true,
+    // 자동 재시작
+    autorestart: true,
+    max_restarts: 10,
+    restart_delay: 3000,
+    // 메모리 초과 시 재시작
+    max_memory_restart: '500M',
+    // 크래시 시 재시작
+    exp_backoff_restart_delay: 1000
+  }]
 };
