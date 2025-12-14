@@ -1,93 +1,232 @@
-# kimdb v6.0.0
+# kimdb
 
-A real-time WebSocket-based JSON document database with CRDT support.
+High-performance document database with CRDT real-time sync.
 
-> ⚠️ **Experimental**: This project is under active development. Use in production with caution.
+```bash
+npm install kimdb
+```
 
 ## Features
 
-- **Real-time Sync**: Bidirectional WebSocket communication
-- **Redis Pub/Sub**: Multi-server clustering support
-- **CRDT**: Conflict-free Replicated Data Types (RGA, LWW-Set)
-- **Rich Text**: Collaborative text editing with Undo/Redo
-- **Presence**: Real-time user awareness
-- **SQLite**: Persistent storage with WAL mode
-- **LRU Cache**: Memory-efficient caching
-- **Prometheus Metrics**: Built-in monitoring
-- **Zero Dependencies**: Core CRDT implementation without external libraries (~35KB)
-
-## Installation
-
-```bash
-git clone https://github.com/bigwash2025a-oss/kimdb.git
-cd kimdb
-npm install
-```
+- **Document Database**: SQLite-based, JSON documents
+- **Real-time Sync**: WebSocket + CRDT (Conflict-free Replicated Data Types)
+- **Offline-first**: Local-first with automatic sync
+- **CRDT Primitives**: VectorClock, LWWSet, LWWMap, RGA, RichText
+- **Presence**: Real-time user presence and cursors
+- **Undo/Redo**: Built-in undo/redo support
+- **TypeScript**: Full TypeScript support
+- **Redis Clustering**: Optional multi-server support
 
 ## Quick Start
 
-```bash
-# Single server
-npm start
+### CLI
 
-# With PM2
-pm2 start ecosystem.config.cjs
+```bash
+# Initialize project
+npx kimdb init
+
+# Start server
+npx kimdb start
 ```
 
-## Environment Variables
+### Server
+
+```typescript
+import { KimDBServer } from 'kimdb/server';
+
+const server = new KimDBServer();
+await server.start();
+// Server running on http://localhost:40000
+```
+
+### Client
+
+```typescript
+import { KimDBClient } from 'kimdb/client';
+
+const client = new KimDBClient({
+  url: 'ws://localhost:40000/ws',
+  apiKey: 'your-api-key',
+});
+
+await client.connect();
+
+// Subscribe to collection
+client.subscribe('posts');
+
+// Open document
+const doc = await client.openDocument('posts', 'post-1');
+
+// Set values
+client.set('posts', 'post-1', 'title', 'Hello World');
+client.set('posts', 'post-1', ['author', 'name'], 'John');
+
+// Listen for sync events
+client.onSync = (collection, event, data) => {
+  console.log('Sync:', collection, event, data);
+};
+```
+
+### CRDT Direct Usage
+
+```typescript
+import { CRDTDocument, LWWSet, VectorClock } from 'kimdb/crdt';
+
+// Document with automatic conflict resolution
+const doc = new CRDTDocument('node1', 'doc-1');
+doc.set('title', 'My Document');
+doc.listInsert('tags', 0, 'crdt');
+doc.setAdd('authors', 'user1');
+
+// Get as plain object
+const obj = doc.toObject();
+
+// Serialize for network/storage
+const json = doc.toJSON();
+const restored = CRDTDocument.fromJSON(json);
+
+// Standalone CRDT types
+const set = new LWWSet('node1');
+set.add('item1');
+set.remove('item2');
+```
+
+## Configuration
+
+Environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| PORT | 40000 | API server port |
-| REDIS_HOST | 127.0.0.1 | Redis host for clustering |
-| REDIS_PORT | 6379 | Redis port |
-| SERVER_ID | hostname | Server identifier |
+| `KIMDB_API_KEY` | (required in prod) | API key for authentication |
+| `KIMDB_PORT` | 40000 | Server port |
+| `KIMDB_HOST` | 0.0.0.0 | Server host |
+| `KIMDB_DATA_DIR` | ./data | Data directory |
+| `REDIS_ENABLED` | false | Enable Redis for clustering |
+| `MARIADB_ENABLED` | false | Enable MariaDB for logging |
 
-## API Endpoints
+## REST API
 
-### REST API
+### Health Check
+```
+GET /health
+```
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | /health | Server health check |
-| GET | /metrics | Prometheus metrics |
-| GET | /api/collections | List all collections |
-| POST | /api/:collection | Create document |
-| GET | /api/:collection/:id | Get document |
-| PUT | /api/:collection/:id | Update document |
-| DELETE | /api/:collection/:id | Delete document |
+### Collections
+```
+GET /api/collections
+GET /api/c/:collection
+GET /api/c/:collection/:id
+```
 
-### WebSocket API
+### SQL API
+```
+POST /api/sql
+{
+  "sql": "SELECT * FROM table WHERE id = ?",
+  "params": [1],
+  "collection": "my_collection"
+}
+```
 
-```javascript
-const ws = new WebSocket('ws://localhost:40000');
+## WebSocket API
 
-// Subscribe to collection
-ws.send(JSON.stringify({
-  type: 'subscribe',
-  collection: 'users'
-}));
+Connect to `ws://host:port/ws`
 
-// Create document
-ws.send(JSON.stringify({
-  type: 'create',
-  collection: 'users',
-  data: { name: 'kim' }
-}));
+### Messages
 
-// Update document
-ws.send(JSON.stringify({
-  type: 'update',
-  collection: 'users',
-  id: 'doc-id',
-  data: { name: 'updated' }
-}));
+```typescript
+// Subscribe
+{ type: 'subscribe', collection: 'posts' }
 
-// Listen for changes
-ws.onmessage = (event) => {
-  const msg = JSON.parse(event.data);
-  console.log('Change:', msg);
-};
+// Get CRDT state
+{ type: 'crdt_get', collection: 'posts', docId: 'post-1' }
+
+// Set value
+{ type: 'crdt_set', collection: 'posts', docId: 'post-1', path: 'title', value: 'Hello' }
+
+// Batch operations
+{ type: 'crdt_ops', collection: 'posts', docId: 'post-1', operations: [...] }
+
+// Presence
+{ type: 'presence_join', collection: 'posts', docId: 'post-1', user: { name: 'John' } }
+```
+
+## CRDT Types
+
+### VectorClock
+Logical clock for causal ordering.
+
+```typescript
+const clock = new VectorClock('node1');
+clock.tick();
+clock.merge(otherClock);
+clock.compare(otherClock); // -1, 0, 1
+```
+
+### LWWSet (Last-Writer-Wins Set)
+Set with timestamps for conflict resolution.
+
+```typescript
+const set = new LWWSet('node1');
+set.add('item');
+set.remove('item');
+set.has('item');
+set.toArray();
+```
+
+### LWWMap
+Map with LWW conflict resolution.
+
+```typescript
+const map = new LWWMap('node1');
+map.set('key', 'value');
+map.get('key');
+map.delete('key');
+map.toObject();
+```
+
+### RGA (Replicated Growable Array)
+Ordered list/text with character-level sync.
+
+```typescript
+const rga = new RGA('node1');
+rga.insert(0, 'a');
+rga.insert(1, 'b');
+rga.delete(0);
+rga.toArray();
+rga.toString();
+```
+
+### RichText
+Rich text with formatting support.
+
+```typescript
+const rt = new RichText('node1');
+rt.insert(0, 'H', { bold: true });
+rt.format(0, 5, { italic: true });
+rt.toDelta(); // Quill-compatible
+```
+
+## Production Deployment
+
+### PM2
+
+```bash
+# Initialize
+npx kimdb init
+
+# Start with PM2
+pm2 start ecosystem.config.cjs
+```
+
+### Docker
+
+```dockerfile
+FROM node:18-alpine
+WORKDIR /app
+RUN npm install kimdb
+COPY .env .
+CMD ["npx", "kimdb", "start"]
 ```
 
 ## Clustering
@@ -103,61 +242,18 @@ Multi-server synchronization via Redis Pub/Sub:
 
 ```bash
 # Server 1
-PORT=40000 REDIS_HOST=redis-server npm start
+KIMDB_PORT=40000 REDIS_ENABLED=true REDIS_HOST=redis-server npx kimdb start
 
 # Server 2
-PORT=40001 REDIS_HOST=redis-server npm start
+KIMDB_PORT=40001 REDIS_ENABLED=true REDIS_HOST=redis-server npx kimdb start
 ```
 
-## CRDT Implementation
+## Security
 
-kimdb implements the following CRDT algorithms:
-
-- **RGA (Replicated Growable Array)**: For ordered sequences and text
-- **LWW-Register**: For single values with last-writer-wins semantics
-- **LWW-Set**: For sets with add/remove operations
-- **3-Way Merge**: For complex object merging
-- **Operation Inversion**: For undo/redo support
-
-## Benchmarks
-
-| Test | Result |
-|------|--------|
-| Feature tests | 13/13 passed |
-| Load test (100 clients) | 32K msg/sec |
-| Load test (10,000 clients) | 57K msg/sec, 100% success |
-| Cluster test (2 servers) | 2.1M sync events, 0 errors |
-| Integrity test | 1,000 docs, 30 min verified |
-
-## Project Structure
-
-```
-kimdb/
-├── src/
-│   ├── api-server.js      # Main API server
-│   ├── kimdb-core.js      # Core database engine
-│   ├── crdt.js            # CRDT implementations
-│   └── ...
-├── test/
-│   ├── feature-test.js    # Feature tests
-│   ├── load-test.js       # Load tests
-│   ├── cluster-test.js    # Cluster tests
-│   └── integrity-test.js  # Data integrity tests
-└── ecosystem.config.cjs   # PM2 configuration
-```
-
-## Roadmap
-
-- [ ] More CRDT types (Counter, Map)
-- [ ] Offline-first sync queue
-- [ ] Authentication middleware
-- [ ] Horizontal scaling beyond 2 nodes
-- [ ] Admin dashboard
-
-## Contributing
-
-Issues and PRs welcome. This is an experimental project - expect breaking changes.
+- Set `KIMDB_API_KEY` environment variable (required in production)
+- API key is validated on all HTTP and WebSocket requests
+- Use HTTPS/WSS in production
 
 ## License
 
-MIT License
+MIT

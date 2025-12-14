@@ -1,10 +1,26 @@
 # Dependencies
 node_modules/
-__pycache__/
-*.pyc
+
+# Build output
+dist/
+
+# Data
+data/
+shared_database/
+backups/
+*.db
+*.db-wal
+*.db-shm
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Environment
 .env
-.venv/
-venv/
+.env.local
+.env.*.local
 
 # IDE
 .vscode/
@@ -12,26 +28,14 @@ venv/
 *.swp
 *.swo
 
-# Logs
-logs/
-*.log
-
 # OS
 .DS_Store
 Thumbs.db
 
-# Build
-dist/
-build/
-*.egg-info/
+# Test
+coverage/
+.vitest/
 
-# Backups
-backups/*.db
-
-# SQLite WAL files
-*.db-shm
-*.db-wal
-
-# Database files
-*.db
-shared_database/*.db
+# Misc
+*.tgz
+.npmrc

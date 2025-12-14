@@ -1,3 +1,6 @@
+/**
+ * 🤖 KIMDB AI Simple System - 빠른 5000명 AI 등록
+ */
 export class SimpleAIGenerator {
     generateAIs(count = 5000) {
         console.log(`🤖 Generating ${count} AI agents...`);
@@ -20,7 +23,7 @@ export class SimpleAIGenerator {
             const teamSkills = skillsByTeam[team];
             const selectedSkills = teamSkills
                 .sort(() => 0.5 - Math.random())
-                .slice(0, 2 + Math.floor(Math.random() * 2));
+                .slice(0, 2 + Math.floor(Math.random() * 2)); // 2-3개 스킬
             const ai = {
                 id: `ai_${i.toString().padStart(4, '0')}`,
                 name: `${personality}${team.replace('CODE', '')}_${i}`,

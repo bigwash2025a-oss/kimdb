@@ -1,7 +1,14 @@
+/**
+ * 🤖 KIMDB AI Generator - 5000명 AI 생성기
+ * 성격, 포트, 능력치를 가진 AI 대량 생성
+ */
 import { AI_TEAM_CONFIGS, PERSONALITY_TEMPLATES, TEAM_PERSONALITY_WEIGHTS } from './ai-schema.js';
 export class AIGenerator {
     usedPorts = new Set();
     createdCount = 0;
+    /**
+     * 5000명 AI 전체 생성
+     */
     async generateAllAIs() {
         const allAIs = [];
         console.log('🤖 Starting AI generation for 5000 agents...');
@@ -14,6 +21,9 @@ export class AIGenerator {
         console.log(`\n🎉 Total AI generated: ${allAIs.length}/5000`);
         return allAIs;
     }
+    /**
+     * 팀별 AI 생성
+     */
     async generateTeamAIs(teamCode, count) {
         const teamAIs = [];
         const teamConfig = AI_TEAM_CONFIGS.find(t => t.teamCode === teamCode);
@@ -21,17 +31,25 @@ export class AIGenerator {
         for (let i = 0; i < count; i++) {
             const ai = this.generateSingleAI(teamCode, teamConfig, personalityWeights);
             teamAIs.push(ai);
+            // 진행률 표시
             if ((i + 1) % 100 === 0) {
                 console.log(`  Progress: ${i + 1}/${count} (${Math.round((i + 1) / count * 100)}%)`);
             }
         }
         return teamAIs;
     }
+    /**
+     * 단일 AI 생성
+     */
     generateSingleAI(teamCode, teamConfig, personalityWeights) {
         this.createdCount++;
+        // ID 생성
         const id = `ai_${this.createdCount.toString().padStart(4, '0')}`;
+        // 포트 할당
         const port = this.allocatePort(teamConfig.portRange);
+        // 성격 타입 선택 (가중치 기반)
         const personalityType = this.selectWeightedPersonality(personalityWeights);
+        // AI 생성
         const ai = {
             id,
             name: this.generateAIName(personalityType, teamCode),
@@ -43,10 +61,13 @@ export class AIGenerator {
             createdAt: new Date(),
             lastActive: new Date(),
             totalTasks: 0,
-            successRate: 85 + Math.random() * 15
+            successRate: 85 + Math.random() * 15 // 85-100%
         };
         return ai;
     }
+    /**
+     * 포트 할당
+     */
     allocatePort(portRange) {
         let attempts = 0;
         while (attempts < 1000) {
@@ -59,6 +80,9 @@ export class AIGenerator {
         }
         throw new Error(`Cannot allocate port in range ${portRange.start}-${portRange.end}`);
     }
+    /**
+     * 가중치 기반 성격 타입 선택
+     */
     selectWeightedPersonality(weights) {
         const random = Math.random();
         let cumulative = 0;
@@ -68,8 +92,12 @@ export class AIGenerator {
                 return type;
             }
         }
+        // 기본값 (이론적으로 도달하면 안됨)
         return 'SUPPORTER';
     }
+    /**
+     * AI 이름 생성
+     */
     generateAIName(personalityType, teamCode) {
         const prefixes = {
             ANALYZER: ['분석', '논리', '체계', '정밀'],
@@ -92,8 +120,12 @@ export class AIGenerator {
         const number = Math.floor(Math.random() * 999) + 1;
         return `${prefix}${suffix}_${number}`;
     }
+    /**
+     * 성격 생성
+     */
     generatePersonality(type) {
         const template = PERSONALITY_TEMPLATES[type];
+        // 기본 템플릿에 랜덤 변화 추가
         const personality = {
             traits: {
                 creativity: this.varyTrait(template.traits.creativity),
@@ -106,12 +138,16 @@ export class AIGenerator {
             tags: [...template.tags],
             responseStyle: { ...template.responseStyle }
         };
+        // 추가 태그 (랜덤)
         const additionalTags = ['효율적', '신뢰할만한', '열정적', '꼼꼼한', '유연한', '진취적'];
         if (Math.random() > 0.5) {
             personality.tags.push(this.randomChoice(additionalTags));
         }
         return personality;
     }
+    /**
+     * 능력치 생성
+     */
     generateSkills(teamCode, personalityType) {
         const baseSkills = this.getTeamBaseSkills(teamCode);
         const personalityBonus = this.getPersonalitySkillBonus(personalityType);
@@ -136,6 +172,9 @@ export class AIGenerator {
             experience: this.generateExperienceLevel()
         };
     }
+    /**
+     * 팀별 기본 스킬
+     */
     getTeamBaseSkills(teamCode) {
         const teamSkills = {
             CODE1: {
@@ -157,6 +196,9 @@ export class AIGenerator {
         };
         return teamSkills[teamCode];
     }
+    /**
+     * 성격별 스킬 보너스
+     */
     getPersonalitySkillBonus(personalityType) {
         const bonuses = {
             ANALYZER: {
@@ -171,27 +213,32 @@ export class AIGenerator {
                 technical: { programming: 0, database: 0, security: 5, frontend: 0, backend: 0, devops: 10 },
                 soft: { communication: 15, problemSolving: 5, teamwork: 10, leadership: 20, adaptability: 10, learning: 5 }
             },
+            // ... 다른 성격 타입들
         };
         return bonuses[personalityType] || bonuses.ANALYZER;
     }
+    /**
+     * 초기 상태 생성
+     */
     generateInitialStatus() {
         return {
             current: 'active',
             performance: {
-                cpuUsage: 10 + Math.random() * 20,
-                memoryUsage: 20 + Math.random() * 30,
-                responseTime: 50 + Math.random() * 100,
+                cpuUsage: 10 + Math.random() * 20, // 10-30%
+                memoryUsage: 20 + Math.random() * 30, // 20-50%
+                responseTime: 50 + Math.random() * 100, // 50-150ms
                 uptime: 0
             },
             health: {
-                score: 90 + Math.random() * 10,
+                score: 90 + Math.random() * 10, // 90-100
                 lastCheck: new Date(),
                 issues: []
             }
         };
     }
+    // === 유틸리티 메서드들 ===
     varyTrait(baseValue) {
-        const variation = (Math.random() - 0.5) * 20;
+        const variation = (Math.random() - 0.5) * 20; // ±10 변화
         return Math.max(0, Math.min(100, baseValue + variation));
     }
     combineSkillValues(base, bonus) {
@@ -205,7 +252,7 @@ export class AIGenerator {
             CODE4: ['보안감사', 'SSL/TLS', '침투테스트', '모니터링', 'ELK스택', '컴플라이언스', 'OWASP']
         };
         const specialties = teamSpecialties[teamCode] || [];
-        const selectedCount = 2 + Math.floor(Math.random() * 3);
+        const selectedCount = 2 + Math.floor(Math.random() * 3); // 2-4개
         return this.shuffleArray([...specialties]).slice(0, selectedCount);
     }
     generateExperienceLevel() {
@@ -230,5 +277,6 @@ export class AIGenerator {
         return shuffled;
     }
 }
+// 싱글톤 인스턴스
 export const aiGenerator = new AIGenerator();
 //# sourceMappingURL=ai-generator.js.map

@@ -1,3 +1,6 @@
+/**
+ * 🤖 KIMDB AI Simple System - 빠른 5000명 AI 등록
+ */
 export interface SimpleAI {
     id: string;
     name: string;

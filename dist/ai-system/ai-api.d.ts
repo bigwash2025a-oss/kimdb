@@ -1,3 +1,7 @@
+/**
+ * 🤖 KIMDB AI API - 5000명 AI 관리 API
+ * REST 엔드포인트로 AI 조회/관리/상호작용
+ */
 import { FastifyInstance } from 'fastify';
 import { PersonalityType } from './ai-schema.js';
 export interface AIQueryParams {
@@ -40,5 +44,8 @@ export interface AIStatsResponse {
         soft: Record<string, number>;
     };
 }
+/**
+ * AI 시스템 API 라우터 등록
+ */
 export declare function registerAIRoutes(fastify: FastifyInstance): Promise<void>;
 //# sourceMappingURL=ai-api.d.ts.map

@@ -1,3 +1,7 @@
+/**
+ * 🤖 KIMDB AI System - 5000명 AI 스키마
+ * 완전 자체 구현 AI 모드 시스템
+ */
 export interface AIAgent {
     id: string;
     name: string;

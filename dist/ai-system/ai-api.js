@@ -1,7 +1,16 @@
+/**
+ * 🤖 KIMDB AI API - 5000명 AI 관리 API
+ * REST 엔드포인트로 AI 조회/관리/상호작용
+ */
 import { aiGenerator } from './ai-generator.js';
+// 메모리 저장소 (실제로는 KIMDB에 저장)
 let aiDatabase = new Map();
 let isInitialized = false;
+/**
+ * AI 시스템 API 라우터 등록
+ */
 export async function registerAIRoutes(fastify) {
+    // AI 시스템 초기화
     fastify.get('/ai/init', async (request, reply) => {
         if (isInitialized) {
             return reply.code(200).send({
@@ -14,6 +23,7 @@ export async function registerAIRoutes(fastify) {
         const startTime = Date.now();
         try {
             const allAIs = await aiGenerator.generateAllAIs();
+            // 메모리에 저장
             aiDatabase.clear();
             for (const ai of allAIs) {
                 aiDatabase.set(ai.id, ai);
@@ -41,9 +51,11 @@ export async function registerAIRoutes(fastify) {
             });
         }
     });
+    // AI 목록 조회 (필터링 지원)
     fastify.get('/ai', async (request, reply) => {
         const { team, personality, status, experience, skill, limit = 50, offset = 0 } = request.query;
         let filteredAIs = Array.from(aiDatabase.values());
+        // 필터 적용
         if (team) {
             filteredAIs = filteredAIs.filter(ai => ai.codeTeam === team);
         }
@@ -59,6 +71,7 @@ export async function registerAIRoutes(fastify) {
         if (skill) {
             filteredAIs = filteredAIs.filter(ai => ai.skills.specialties.includes(skill));
         }
+        // 페이지네이션
         const total = filteredAIs.length;
         const paginatedAIs = filteredAIs.slice(offset, offset + limit);
         return reply.send({
@@ -72,6 +85,7 @@ export async function registerAIRoutes(fastify) {
             }
         });
     });
+    // 특정 AI 상세 조회
     fastify.get('/ai/:id', async (request, reply) => {
         const { id } = request.params;
         const ai = aiDatabase.get(id);
@@ -86,6 +100,7 @@ export async function registerAIRoutes(fastify) {
             data: ai
         });
     });
+    // AI와 채팅
     fastify.post('/ai/:id/chat', async (request, reply) => {
         const { id } = request.params;
         const { message, context, userId } = request.body;
@@ -103,7 +118,9 @@ export async function registerAIRoutes(fastify) {
             });
         }
         const startTime = Date.now();
+        // AI 응답 생성 (성격 기반)
         const response = generateAIResponse(ai, message, context);
+        // 상태 업데이트
         ai.lastActive = new Date();
         ai.status.performance.responseTime = Date.now() - startTime;
         const chatResponse = {
@@ -119,6 +136,7 @@ export async function registerAIRoutes(fastify) {
             data: chatResponse
         });
     });
+    // AI에게 작업 할당
     fastify.post('/ai/:id/task', async (request, reply) => {
         const { id } = request.params;
         const taskRequest = request.body;
@@ -135,6 +153,7 @@ export async function registerAIRoutes(fastify) {
                 error: 'AI is currently busy with another task'
             });
         }
+        // 작업 시작
         const taskId = `task_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
         ai.status.current = 'busy';
         ai.status.currentTask = {
@@ -144,6 +163,7 @@ export async function registerAIRoutes(fastify) {
             progress: 0
         };
         ai.totalTasks++;
+        // 예상 완료 시간 계산 (성격과 스킬 기반)
         const estimatedDuration = calculateTaskDuration(ai, taskRequest);
         return reply.send({
             success: true,
@@ -156,6 +176,7 @@ export async function registerAIRoutes(fastify) {
             }
         });
     });
+    // AI 상태 업데이트
     fastify.put('/ai/:id/status', async (request, reply) => {
         const { id } = request.params;
         const { status } = request.body;
@@ -177,6 +198,7 @@ export async function registerAIRoutes(fastify) {
             }
         });
     });
+    // AI 통계
     fastify.get('/ai/stats', async (request, reply) => {
         const allAIs = Array.from(aiDatabase.values());
         if (allAIs.length === 0) {
@@ -199,10 +221,15 @@ export async function registerAIRoutes(fastify) {
                 soft: {}
             }
         };
+        // 통계 계산
         for (const ai of allAIs) {
+            // 팀별
             stats.byTeam[ai.codeTeam] = (stats.byTeam[ai.codeTeam] || 0) + 1;
+            // 성격별
             stats.byPersonality[ai.personality.type] = (stats.byPersonality[ai.personality.type] || 0) + 1;
+            // 상태별
             stats.byStatus[ai.status.current] = (stats.byStatus[ai.status.current] || 0) + 1;
+            // 경험별
             stats.byExperience[ai.skills.experience] = (stats.byExperience[ai.skills.experience] || 0) + 1;
         }
         return reply.send({
@@ -210,6 +237,7 @@ export async function registerAIRoutes(fastify) {
             data: stats
         });
     });
+    // 팀별 AI 조회
     fastify.get('/ai/team/:team', async (request, reply) => {
         const { team } = request.params;
         if (!['CODE1', 'CODE2', 'CODE3', 'CODE4'].includes(team)) {
@@ -227,6 +255,7 @@ export async function registerAIRoutes(fastify) {
             count: teamAIs.length
         });
     });
+    // AI 검색 (이름, 태그, 전문분야)
     fastify.get('/ai/search', async (request, reply) => {
         const { q, limit = 20 } = request.query;
         if (!q || q.length < 2) {
@@ -248,9 +277,14 @@ export async function registerAIRoutes(fastify) {
         });
     });
 }
+// === 유틸리티 함수들 ===
+/**
+ * AI 응답 생성 (성격 기반)
+ */
 function generateAIResponse(ai, message, context) {
     const personality = ai.personality;
     const style = personality.responseStyle;
+    // 기본 응답 템플릿
     const responses = [
         `안녕하세요! 저는 ${ai.name}입니다.`,
         `${message}에 대해 말씀드리자면,`,
@@ -258,6 +292,7 @@ function generateAIResponse(ai, message, context) {
         `${ai.codeTeam} 팀에서 활동하고 있어요.`
     ];
     let response = responses[Math.floor(Math.random() * responses.length)];
+    // 성격별 응답 스타일 적용
     if (personality.type === 'ANALYZER') {
         response = `분석해보면, ${message}의 경우 체계적인 접근이 필요합니다. 데이터를 기반으로 판단하는 것이 중요하겠네요.`;
     }
@@ -270,23 +305,30 @@ function generateAIResponse(ai, message, context) {
     else if (personality.type === 'SUPPORTER') {
         response = `도움이 필요하시군요! 😊 ${message}에 대해 제가 최선을 다해 지원해드리겠습니다. 함께 해결해봐요!`;
     }
+    // 이모지 추가 (스타일에 따라)
     if (style.emoji && Math.random() > 0.5) {
         const emojis = ['✨', '🚀', '💡', '⚡', '🎯', '👍', '🔥'];
         response += ` ${emojis[Math.floor(Math.random() * emojis.length)]}`;
     }
+    // 격식 조정
     if (style.formality === 'formal') {
         response = response.replace(/요!/g, '습니다.').replace(/어요/g, '습니다');
     }
     return response;
 }
+/**
+ * 작업 소요시간 계산
+ */
 function calculateTaskDuration(ai, task) {
-    const baseTime = 3600;
+    const baseTime = 3600; // 1시간 (초)
+    // 경험도에 따른 조정
     const experienceMultiplier = {
         junior: 1.5,
         mid: 1.0,
         senior: 0.7,
         expert: 0.5
     };
+    // 우선순위에 따른 조정
     const priorityMultiplier = {
         low: 0.8,
         medium: 1.0,
@@ -296,7 +338,7 @@ function calculateTaskDuration(ai, task) {
     const adjustedTime = baseTime *
         experienceMultiplier[ai.skills.experience] *
         priorityMultiplier[task.priority] *
-        (0.8 + Math.random() * 0.4);
+        (0.8 + Math.random() * 0.4); // 20% 랜덤 변동
     return Math.round(adjustedTime);
 }
 //# sourceMappingURL=ai-api.js.map

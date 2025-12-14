@@ -1,3 +1,8 @@
+/**
+ * 🤖 KIMDB AI System - 5000명 AI 스키마
+ * 완전 자체 구현 AI 모드 시스템
+ */
+// AI 팀 설정 (간소화된 버전)
 export const AI_TEAM_CONFIGS = [
     {
         teamCode: 'CODE1',
@@ -36,6 +41,7 @@ export const AI_TEAM_CONFIGS = [
         leadership: { style: 'democratic' }
     }
 ];
+// 성격별 기본 설정
 export const PERSONALITY_TEMPLATES = {
     ANALYZER: {
         traits: { creativity: 30, logic: 95, social: 40, energy: 60, stability: 85 },
@@ -78,6 +84,7 @@ export const PERSONALITY_TEMPLATES = {
         responseStyle: { formality: 'friendly', emoji: true, verbosity: 'detailed', tone: 'calm' }
     }
 };
+// 팀별 성격 분포 (가중치)
 export const TEAM_PERSONALITY_WEIGHTS = {
     CODE1: {
         CREATOR: 0.3,
